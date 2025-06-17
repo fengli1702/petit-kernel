@@ -1,0 +1,8 @@
+/target
+build
+*~
+.*
+*.egg-info
+*.so
+__pycache__
+dist
