@@ -1,0 +1,27 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "wheel",
+    "torch>=2.5.1",
+    "cmake>=3.22",
+    "ninja",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "petit_kernel"
+version = "0.0.1"
+description = "Optimized FP4 GPU kernels for AMD GPUs"
+authors = [
+    {name = "Haohui Mai", email = "haohui@causalflow.ai"}
+]
+maintainers = [
+    {name = "Haohui Mai", email = "haohui@causalflow.ai"}
+]
+
+[project.urls]
+Homepage = "https://github.com/causalflow-ai/petit-kernel"
+
+[tool.setuptools]
+packages = ["petit_kernel"]
+package-dir = {"" = "."}

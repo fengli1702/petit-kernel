@@ -1,0 +1,2 @@
+#cmakedefine WITH_CUDA
+#cmakedefine WITH_ROCM
