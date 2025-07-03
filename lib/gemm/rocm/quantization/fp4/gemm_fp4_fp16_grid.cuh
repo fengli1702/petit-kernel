@@ -1,6 +1,7 @@
-#include "algo_variants.h"
 #include "gemm/gpu/quantization/reduce.cuh"
+#include "gemm/rocm/quantization/gemm.h"
 #include "gemm/rocm/quantization/kernel_config.cuh"
+#include "gemm_fp4.h"
 #include "utils/assert.h"
 #include "warp_schedule_fp16.cuh"
 
@@ -383,75 +384,5 @@ template <SolutionId id> struct ConfigSelector {
         return 0;
     }
 };
-
-class Dispatcher {
-  public:
-    using Solutions = decltype(fp4::detail::kAvailableSolutions);
-    static constexpr size_t kN = sizeof(Solutions) / sizeof(SolutionId);
-    using Call = std::function<int(
-        unsigned *, const unsigned *, const unsigned *, const unsigned *, float,
-        const unsigned, const unsigned, const unsigned, hipStream_t)>;
-    static Dispatcher &GetInstance() {
-        static Dispatcher instance;
-        return instance;
-    }
-
-    int Dispatch(unsigned *c, const unsigned *a, const unsigned *b,
-                 const unsigned *scales, float global_scale, const unsigned m,
-                 const unsigned n, const unsigned k, unsigned long solution_id,
-                 hipStream_t stream) {
-        const auto it = solution_id_to_call_.find(solution_id);
-        if (it == solution_id_to_call_.end()) {
-            return kErrorKernelShape;
-        }
-        return it->second(c, a, b, scales, global_scale, m, n, k, stream);
-    }
-
-  protected:
-    std::unordered_map<unsigned long, Call> solution_id_to_call_;
-    template <SolutionId... sols>
-    static std::unordered_map<unsigned long, Call> ToDispatchEntries() {
-        return {
-            {sols.Repr(),
-             [](unsigned *c, const unsigned *a, const unsigned *b,
-                const unsigned *scales, float global_scale, const unsigned m,
-                const unsigned n, const unsigned k, hipStream_t stream) {
-                 using Trait = ConfigSelector<sols>;
-                 return Trait::Invoke(c, a, b, scales, global_scale, m, n, k,
-                                      stream);
-             }}...};
-    }
-
-    template <auto Array, std::size_t... Is>
-    auto MakeDispatchMapWithIndices(std::index_sequence<Is...>) {
-        return ToDispatchEntries<Array[Is]...>();
-    }
-
-    Dispatcher()
-        : solution_id_to_call_(
-              MakeDispatchMapWithIndices<fp4::detail::kAvailableSolutions>(
-                  std::make_index_sequence<kN>{})) {}
-};
-
-int GemmFp4Fp16Grid(unsigned *c, const unsigned *a, const unsigned *b,
-                    const unsigned *scales, float global_scale,
-                    const unsigned m, const unsigned n, const unsigned k,
-                    const PetitSolutionHints &hints, unsigned long solution_id,
-                    hipStream_t stream) {
-    if (m == 0 || n == 0 || k == 0) {
-        return 0;
-    }
-
-    if (solution_id == -1) {
-        solution_id = ChooseDefaultFp4Fp16Solution(m, n, k, hints);
-    }
-
-    if (solution_id == -1) {
-        return kErrorProblemShape;
-    }
-
-    return Dispatcher::GetInstance().Dispatch(c, a, b, scales, global_scale, m,
-                                              n, k, solution_id, stream);
-}
 
 } // namespace causalflow::petit::rocm::quantization::fp4

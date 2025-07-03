@@ -47,9 +47,28 @@ struct SolutionId {
     unsigned warp_partition_n : 4;
     unsigned warp_partition_k : 4;
     MatmulWarpPartition warp_partition : 4;
+    unsigned padding : 16;
 
     constexpr unsigned long Repr() const {
         return *(const unsigned long *)(this);
+    }
+
+    static constexpr SolutionId FromRepr(unsigned long repr) {
+        return SolutionId{
+            .tile_m = static_cast<unsigned int>((repr >> 0) & 0xf),
+            .tile_n = static_cast<unsigned int>((repr >> 4) & 0xf),
+            .tile_k = static_cast<unsigned int>((repr >> 8) & 0xff),
+            .features = static_cast<MatmulFeatures>((repr >> 16) & 0xf),
+            .pipeline = static_cast<MatmulPipeline>((repr >> 20) & 0xf),
+            .element_b = static_cast<MatmulElementB>((repr >> 24) & 0xf),
+            .mfma_type = static_cast<MatmulMfmaType>((repr >> 28) & 0xf),
+            .warp_partition_m = static_cast<unsigned int>((repr >> 32) & 0xf),
+            .warp_partition_n = static_cast<unsigned int>((repr >> 36) & 0xf),
+            .warp_partition_k = static_cast<unsigned int>((repr >> 40) & 0xf),
+            .warp_partition =
+                static_cast<MatmulWarpPartition>((repr >> 44) & 0xf),
+            .padding = 0,
+        };
     }
 
     static constexpr SolutionId
@@ -61,7 +80,7 @@ struct SolutionId {
         return SolutionId{tile_m,           tile_n,           tile_k / 4,
                           features,         pipeline,         element_b,
                           mfma_type,        warp_partition_m, warp_partition_n,
-                          warp_partition_k, warp_partition};
+                          warp_partition_k, warp_partition,   0};
     }
 
     static constexpr SolutionId Default() {

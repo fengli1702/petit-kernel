@@ -1,4 +1,3 @@
-#include "gemm/rocm/quantization/fp4/algo_variants.h"
 #include "gemm/rocm/quantization/fp4/gemm_fp4.h"
 #include "gemm/rocm/quantization/gemm.h"
 #include "pybind.h"
@@ -160,14 +159,16 @@ torch::Tensor MulFp4A16(const torch::Tensor &A, const torch::Tensor &B,
 
 py::list GetFp4Solutions(const PetitSolutionHints &hints, int64_t size_m,
                          int64_t size_n, int64_t size_k) {
+    unsigned n_solutions = 0;
+    int err =
+        GemmGetSolutions(hints, size_m, size_n, size_k, nullptr, &n_solutions);
+    if (err != 0) {
+        AT_ERROR("Failed to get solutions: ", err);
+    }
 
-    static constexpr unsigned kAvailableSolutions =
-        sizeof(fp4::detail::kAvailableSolutions) / sizeof(SolutionId);
-    std::array<SolutionId, kAvailableSolutions> solutions;
-    unsigned n_solutions = kAvailableSolutions;
-
-    int err = GemmGetSolutions(hints, size_m, size_n, size_k, solutions.data(),
-                               &n_solutions);
+    std::vector<SolutionId> solutions(n_solutions);
+    err = GemmGetSolutions(hints, size_m, size_n, size_k, solutions.data(),
+                           &n_solutions);
     if (err != 0) {
         AT_ERROR("Failed to get solutions: ", err);
     }
