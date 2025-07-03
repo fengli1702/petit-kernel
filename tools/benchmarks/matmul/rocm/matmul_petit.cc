@@ -145,7 +145,7 @@ absl::Status PetitMatmulFp4Base::PrepareForBatchExecution(
     long stride_b, long stride_c, int batch) {
 
     // Check alignment requirements
-    if (m_ % 16 != 0 || n_ % 16 != 0 || k_ % groupsize_ != 0) {
+    if (n_ % 16 != 0 || k_ % groupsize_ != 0) {
         return absl::InvalidArgumentError(
             "m, n must be multiples of 16, k must be multiple of groupsize");
     }
