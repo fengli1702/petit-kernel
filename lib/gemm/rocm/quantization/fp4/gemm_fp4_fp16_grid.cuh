@@ -69,18 +69,35 @@ template <class TS, class WP> struct WarpMatmulLayoutTrait {
                                             kPackFactor * sizeof(ElementA) /
                                             sizeof(uint4);
 
-    __device__ static inline unsigned XorShmLayout(unsigned idx_n,
-                                                   unsigned idx_k) {
+    __device__ static inline unsigned XorShmLayout(unsigned tile_idx_m,
+                                                   unsigned tile_idx_k,
+                                                   unsigned batch_id,
+                                                   unsigned row, unsigned col) {
         static constexpr unsigned kBatchStride = DiskLayout::kLayoutElementsM;
-        return idx_n * kGroupK / kVecSize + idx_k ^
-               (idx_n % kBatchStride +
-                idx_n / kBatchStride * kBatchStride * kReadBatchA);
+
+        unsigned base = tile_idx_m * kTile * kGroupK / kVecSize +
+                        tile_idx_k * kTile * kLayoutM / kVecSize +
+                        batch_id * kWarpSize;
+        unsigned xor_stride = col * kBatchStride + batch_id;
+        return base + col * kMmaM + row ^ xor_stride;
     }
 
-    __device__ static inline unsigned WriteShmCoordA(unsigned idx) {
-        unsigned row = idx / (kGroupK / kVecSize),
-                 col = idx % (kGroupK / kVecSize);
-        return XorShmLayout(row, col);
+    __device__ static inline unsigned WriteShmCoordA(unsigned tid,
+                                                     unsigned steps) {
+        static_assert(WP::kThreads % (kGroupK / kVecSize) == 0,
+                      "Unaligned GroupK");
+        static constexpr unsigned kRowBlock = kGroupK / kVecSize;
+        static constexpr unsigned kLoopInc = WP::kThreads / kRowBlock;
+
+        unsigned row = tid / kRowBlock + kLoopInc * steps,
+                 col = tid % kRowBlock;
+        unsigned tile_idx_m = row / kTile,
+                 tile_idx_k = col / (kLayoutM / kVecSize);
+        unsigned row_in_tile = row % kTile,
+                 col_in_tile = col % (kLayoutM / kVecSize);
+        unsigned batch_id = col_in_tile % kLayoutElementsM;
+        return XorShmLayout(tile_idx_m, tile_idx_k, batch_id, row_in_tile,
+                            col_in_tile / kLayoutElementsM);
     }
 
     __device__ static inline unsigned ReadShmCoordA(unsigned tile_idx_m,
@@ -88,10 +105,8 @@ template <class TS, class WP> struct WarpMatmulLayoutTrait {
                                                     unsigned batch_id,
                                                     unsigned wtid) {
         unsigned row_in_tile = wtid % kMmaM, col_in_tile = wtid / kMmaM;
-        unsigned row = tile_idx_m * kTile + row_in_tile;
-        unsigned col = (kLayoutM / kVecSize) * tile_idx_k +
-                       col_in_tile * kLayoutElementsM + batch_id;
-        return XorShmLayout(row, col);
+        return XorShmLayout(tile_idx_m, tile_idx_k, batch_id, row_in_tile,
+                            col_in_tile);
     }
 };
 
@@ -137,8 +152,9 @@ struct GEMMFp4Fp16Config {
         WarpMatmulLayout::kThreadAccumTileNRegs;
     using ThreadAccum = typename WarpMatmulLayout::ThreadAccum;
 
-    __device__ static inline unsigned WriteShmCoordA(unsigned idx) {
-        return WarpMatmulLayout::WriteShmCoordA(idx);
+    __device__ static inline unsigned WriteShmCoordA(unsigned tid,
+                                                     unsigned steps) {
+        return WarpMatmulLayout::WriteShmCoordA(tid, steps);
     }
 
     __device__ static inline unsigned ReadShmCoordA(unsigned tile_idx_m,

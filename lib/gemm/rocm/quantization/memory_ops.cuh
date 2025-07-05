@@ -181,7 +181,7 @@ MatrixALayout<Config>::StoreShared(const uint4 reg_a[kLoadGlobalA],
         sizeof(Shm) / sizeof(uint4) % kThreads == 0;
 
     for (unsigned i = 0, idx = tid; i < kLoadGlobalA; ++i, idx += kThreads) {
-        auto shm_coord = Config::WriteShmCoordA(idx);
+        auto shm_coord = Config::WriteShmCoordA(tid, i);
         auto shm_ptr = GetConditionShmPtr(
             reinterpret_cast<uint4 *>(shm) + shm_coord,
             kAlignedShmA || idx < kGroupM * kGroupK / kVecSize);
