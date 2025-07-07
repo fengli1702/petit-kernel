@@ -17,17 +17,95 @@ namespace causalflow::petit::rocm::quantization::fp4 {
 static constexpr unsigned kTile = 16;
 unsigned long ChooseDefaultFp4Fp16Solution(unsigned m, unsigned n, unsigned k,
                                            const PetitSolutionHints &hints);
-
-template <class TileShape_, class WarpPartition_, unsigned kPipelineStages,
-          bool kHighPrecision_>
-struct GEMMFp4Fp16Config {
+struct QWeightOnDiskLayout128x16 {
     // kLayoutM is dimension K
     static constexpr unsigned kLayoutM = 128;
     static constexpr unsigned kLayoutN = 16;
 
+    // How many consecutive elements on the (m,n) orders
+    static constexpr unsigned kLayoutElementsM = 4;
+    static constexpr unsigned kLayoutElementsN = 1;
+    static_assert(kLayoutElementsM * kLayoutElementsN == 4, "");
+};
+
+template <class TS, class WP> struct WarpMatmulLayoutTrait {
+    using ElementA = typename TS::ElementA;
+    using DiskLayout = QWeightOnDiskLayout128x16;
+    static constexpr unsigned kLayoutM = DiskLayout::kLayoutM;
+    static constexpr unsigned kLayoutN = DiskLayout::kLayoutN;
+    static constexpr unsigned kGroupK = TS::kGroupK;
+
+    static constexpr unsigned kVecSize = sizeof(uint4) / sizeof(ElementA);
+    static constexpr unsigned kMmaM = 16;
+    static constexpr unsigned kMmaTileK = kVecSize * kWarpSize / kMmaM;
+
+    // The number of tiles in the m dimension that a warp is responsible to.
+    static constexpr unsigned kWarpTileM = TS::kNumTileM / WP::kPartitionM;
+
+    // Each warp works on a kLayoutM x kLayoutN tile.
+    static constexpr unsigned kWarpAtomK = kGroupK / kLayoutM / WP::kPartitionK;
+    static constexpr unsigned kWarpAtomN =
+        TS::kGroupN / kLayoutN / WP::kPartitionN;
+    static_assert(kWarpAtomK > 0, "");
+    static_assert(kWarpAtomN > 0, "");
+
+    // Determine by the data layout and how the 4-uint quantized weights are
+    // arranged.
+    static constexpr unsigned kAccTilePerThread = kLayoutN / kTile;
+    static constexpr unsigned kThreadAccumTileNRegs =
+        kWarpAtomN * kAccTilePerThread;
+
+    static_assert(kThreadAccumTileNRegs > 0, "");
+    static_assert(kGroupK % kLayoutM == 0,
+                  "kGroupK must be a multiple of kLayoutM");
+    static_assert(TS::kNumTileN % WP::kPartitionN == 0 &&
+                      TS::kNumTileK % WP::kPartitionK == 0,
+                  "The number of tiles must be divisible by the partition "
+                  "dimensions");
+
+    using ThreadAccum = float4[kWarpTileM][kThreadAccumTileNRegs];
+    static constexpr unsigned kLayoutElementsM = DiskLayout::kLayoutElementsM;
+    static constexpr unsigned kReadBatchA = DiskLayout::kLayoutElementsM *
+                                            kPackFactor * sizeof(ElementA) /
+                                            sizeof(uint4);
+
+    __device__ static inline unsigned XorShmLayout(unsigned idx_n,
+                                                   unsigned idx_k) {
+        static constexpr unsigned kBatchStride = DiskLayout::kLayoutElementsM;
+        return idx_n * kGroupK / kVecSize + idx_k ^
+               (idx_n % kBatchStride +
+                idx_n / kBatchStride * kBatchStride * kReadBatchA);
+    }
+
+    __device__ static inline unsigned WriteShmCoordA(unsigned idx) {
+        unsigned row = idx / (kGroupK / kVecSize),
+                 col = idx % (kGroupK / kVecSize);
+        return XorShmLayout(row, col);
+    }
+
+    __device__ static inline unsigned ReadShmCoordA(unsigned tile_idx_m,
+                                                    unsigned tile_idx_k,
+                                                    unsigned batch_id,
+                                                    unsigned wtid) {
+        unsigned row_in_tile = wtid % kMmaM, col_in_tile = wtid / kMmaM;
+        unsigned row = tile_idx_m * kTile + row_in_tile;
+        unsigned col = (kLayoutM / kVecSize) * tile_idx_k +
+                       col_in_tile * kLayoutElementsM + batch_id;
+        return XorShmLayout(row, col);
+    }
+};
+
+template <class TileShape_, class WarpPartition_, unsigned kPipelineStages,
+          bool kHighPrecision_>
+struct GEMMFp4Fp16Config {
     using TS = TileShape_;
     using WP = WarpPartition_;
     using ElementA = typename TS::ElementA;
+    using WarpMatmulLayout = WarpMatmulLayoutTrait<TS, WP>;
+
+    static constexpr unsigned kLayoutM = WarpMatmulLayout::kLayoutM;
+    static constexpr unsigned kLayoutN = WarpMatmulLayout::kLayoutN;
+
     static constexpr bool kHighPrecision = kHighPrecision_;
 
     static constexpr unsigned kVecSize = sizeof(uint4) / sizeof(ElementA);
@@ -46,52 +124,29 @@ struct GEMMFp4Fp16Config {
     static constexpr unsigned kNumWarps = WP::kNumWarps;
     static constexpr unsigned kThreads = WP::kThreads;
 
-    // The number of tiles in the m dimension that a warp is responsible to.
-    static constexpr unsigned kWarpTileM = kNumTileM / WP::kPartitionM;
+    static constexpr unsigned kWarpTileM = WarpMatmulLayout::kWarpTileM;
 
-    static constexpr unsigned kMmaM = 16;
-    static constexpr unsigned kMmaN = 16;
-    static constexpr unsigned kMmaTileK = kVecSize * kWarpSize / kMmaM;
     static constexpr unsigned kStages = kPipelineStages;
 
     static constexpr bool kUseZeroPoints = false;
     static constexpr bool kZpInShm = false;
 
+    // Determine by the data layout and how the 4-uint quantized weights are
+    // arranged.
     static constexpr unsigned kThreadAccumTileNRegs =
-        kNumTileN / WP::kPartitionN / (kMmaN / kTile);
-    using ThreadAccum = float4[kWarpTileM][kThreadAccumTileNRegs];
-
-    static_assert(kThreadAccumTileNRegs > 0, "");
-    static_assert(kGroupK % kLayoutM == 0,
-                  "kGroupK must be a multiple of kLayoutM");
-    static_assert(kNumTileN % WP::kPartitionN == 0 &&
-                      kNumTileK % WP::kPartitionK == 0,
-                  "The number of tiles must be divisible by the partition "
-                  "dimensions");
-
-    __device__ static inline unsigned XorShmLayout(unsigned row, unsigned col) {
-        static constexpr unsigned kBatchStride = kMmaTileK / kVecSize;
-        static constexpr unsigned kBatches = kWarpSize / kMmaM;
-        return row * kGroupK / kVecSize + col ^
-               (row % kBatchStride +
-                row / kBatchStride * kBatchStride * kBatches);
-    }
+        WarpMatmulLayout::kThreadAccumTileNRegs;
+    using ThreadAccum = typename WarpMatmulLayout::ThreadAccum;
 
     __device__ static inline unsigned WriteShmCoordA(unsigned idx) {
-        unsigned row = idx / (kGroupK / kVecSize),
-                 col = idx % (kGroupK / kVecSize);
-        return XorShmLayout(row, col);
+        return WarpMatmulLayout::WriteShmCoordA(idx);
     }
 
     __device__ static inline unsigned ReadShmCoordA(unsigned tile_idx_m,
                                                     unsigned tile_idx_k,
                                                     unsigned batch_id,
                                                     unsigned wtid) {
-        unsigned row_in_tile = wtid % kMmaM, col_in_tile = wtid / kMmaM;
-        unsigned row = tile_idx_m * kTile + row_in_tile;
-        unsigned col = (kLayoutM / kVecSize) * tile_idx_k +
-                       col_in_tile * (kMmaTileK / kVecSize) + batch_id;
-        return XorShmLayout(row, col);
+        return WarpMatmulLayout::ReadShmCoordA(tile_idx_m, tile_idx_k, batch_id,
+                                               wtid);
     }
 };
 

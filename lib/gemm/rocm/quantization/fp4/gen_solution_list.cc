@@ -27,21 +27,19 @@ struct TileShapeAndWarpPartition {
 using TSWP = TileShapeAndWarpPartition;
 
 static constexpr unsigned kTile = 16;
+static constexpr unsigned kLayoutM = 128;
+static constexpr unsigned kLayoutN = 16;
 
-// TileShapeAndWarpPartition
+// TileShapeAndWarpPartition, order by (n, k, m)
 static constexpr TSWP kTSWP[] = {
-    {1, 4, 8, 1, 4, 1},  {2, 4, 8, 1, 4, 1},  {4, 4, 8, 1, 4, 1},
-    {1, 2, 16, 1, 2, 2}, {2, 2, 16, 1, 2, 2}, {4, 2, 16, 1, 2, 2},
-    {1, 1, 32, 1, 1, 4}, {2, 1, 32, 1, 1, 4}, {1, 4, 32, 1, 2, 1},
-    {2, 4, 32, 1, 2, 1}, {2, 4, 32, 2, 2, 1}, {1, 4, 32, 1, 2, 2},
-    {2, 4, 32, 1, 2, 2}, {2, 4, 32, 2, 2, 2}, {4, 4, 8, 2, 2, 1},
-    {2, 4, 8, 1, 4, 1},  {1, 2, 16, 1, 2, 2}, {2, 8, 8, 1, 4, 1},
-    {1, 4, 16, 1, 2, 2}, {2, 1, 16, 2, 1, 2}, {2, 1, 32, 2, 1, 1},
-    {2, 3, 16, 2, 1, 2}, {2, 4, 8, 1, 4, 1},  {4, 1, 8, 4, 1, 1},
-    {4, 1, 16, 4, 1, 1}, {4, 2, 8, 2, 2, 1},  {4, 3, 8, 4, 1, 1},
-    {4, 3, 16, 4, 1, 1}, {4, 6, 8, 2, 2, 1},  {4, 10, 8, 2, 2, 1},
-    {6, 6, 8, 2, 2, 1},  {8, 4, 8, 2, 2, 1},  {8, 4, 8, 4, 1, 1},
-    {8, 5, 8, 4, 1, 1},
+    {4, 1, 8, 4, 1, 1},  {4, 1, 16, 2, 1, 2}, {1, 1, 32, 1, 1, 4},
+    {2, 1, 32, 2, 1, 2}, {4, 2, 8, 2, 2, 1},  {1, 2, 16, 1, 2, 2},
+    {2, 2, 16, 1, 2, 2}, {4, 2, 16, 1, 2, 2}, {2, 3, 16, 2, 1, 2},
+    {4, 3, 8, 4, 1, 1},  {4, 3, 16, 4, 1, 1}, {1, 4, 8, 1, 4, 1},
+    {2, 4, 8, 2, 2, 1},  {4, 4, 8, 2, 2, 1},  {8, 4, 8, 2, 2, 1},
+    {1, 4, 16, 1, 2, 2}, {1, 4, 32, 1, 2, 2}, {2, 4, 32, 2, 2, 1},
+    {8, 5, 8, 4, 1, 1},  {4, 6, 8, 2, 2, 1},  {6, 6, 8, 2, 2, 1},
+    {2, 8, 8, 2, 2, 1},  {4, 10, 8, 2, 2, 1},
 };
 
 static MatmulPipeline GetPipelineStage(const TSWP &tswp) {
@@ -52,7 +50,9 @@ static MatmulPipeline GetPipelineStage(const TSWP &tswp) {
                         tswp.tile_n * kTile * tswp.tile_k * kTile / 2 +
                         tswp.tile_n * kTile * tswp.tile_k * kTile / kGroupSize;
     if (shm_size > kMaxShmSize) {
-        throw std::runtime_error("Out of shared memory");
+        throw std::runtime_error(fmt::format(
+            "Out of shared memory: {}x{}x{}, minimum shared memory: {}",
+            tswp.tile_m, tswp.tile_n, tswp.tile_k, shm_size));
     } else if (shm_size <= kMaxShmSize / 2) {
         return MatmulPipeline::kMatmulPipeline_2;
     } else {
@@ -63,6 +63,12 @@ static MatmulPipeline GetPipelineStage(const TSWP &tswp) {
 static std::vector<SolutionId> FromTSWPList() {
     std::vector<SolutionId> solutions;
     for (const auto &tswp : kTSWP) {
+        if (tswp.tile_k * kTile % kLayoutM != 0 ||
+            tswp.tile_n * kTile % kLayoutN != 0) {
+            throw std::runtime_error(fmt::format(
+                "Tile shape {}x{} is not aligned with layout {}x{}",
+                tswp.tile_m * kTile, tswp.tile_n * kTile, kLayoutM, kLayoutN));
+        }
         solutions.push_back(SolutionId::MultiStage(
             GetPipelineStage(tswp), MatmulFeatures::kMatmulFeatures_Grid,
             MatmulElementB::kMatmulTypeBFp4,
