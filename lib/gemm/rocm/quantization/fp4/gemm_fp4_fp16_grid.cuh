@@ -258,7 +258,8 @@ template <class Config> struct SingleStagePipeline {
             ctx.AdvanceGlobalPtr();
             __syncthreads();
 
-            Matmul::Compute(shm_buf, acc, curr_stage, wid, wtid);
+            Matmul matmul(shm_buf, curr_stage, wid, wtid);
+            matmul.Compute(acc);
             __syncthreads();
         }
     }
@@ -291,22 +292,27 @@ template <class Config> struct MultiStagePipeline {
                                                 tid);
         }
         StoreShm<Config, PipelineContext>(ctx, shm_buf, curr_stage, tid);
+        typename Matmul::DataA a;
+        typename Matmul::DataB b;
+        Matmul matmul_0(shm_buf, 0, wid, wtid), matmul_1(shm_buf, 1, wid, wtid);
 
         unsigned k_idx = 0;
         for (; k_idx + 3 < k_total; k_idx += 2) {
-#pragma unroll
-            for (unsigned curr_stage = 0; curr_stage < 2; curr_stage++) {
-                unsigned next_stage = curr_stage ^ 1;
-                ctx.AdvanceGlobalPtr();
-                __syncthreads();
+            ctx.AdvanceGlobalPtr();
+            __syncthreads();
 
-                LoadGlobal<Config, PipelineContext>(ctx, n, k, curr_stage, wid,
-                                                    tid);
+            matmul_0.Prefetch(&a, &b);
+            LoadGlobal<Config, PipelineContext>(ctx, n, k, 0, wid, tid);
+            StoreShm<Config, PipelineContext>(ctx, shm_buf, 1, tid);
+            matmul_0.PipelineCompute(&a, &b, acc);
 
-                StoreShm<Config, PipelineContext>(ctx, shm_buf, next_stage,
-                                                  tid);
-                Matmul::Compute(shm_buf, acc, curr_stage, wid, wtid);
-            }
+            ctx.AdvanceGlobalPtr();
+            __syncthreads();
+
+            matmul_1.Prefetch(&a, &b);
+            LoadGlobal<Config, PipelineContext>(ctx, n, k, 1, wid, tid);
+            StoreShm<Config, PipelineContext>(ctx, shm_buf, 0, tid);
+            matmul_1.PipelineCompute(&a, &b, acc);
         }
 
 #pragma unroll
@@ -316,6 +322,8 @@ template <class Config> struct MultiStagePipeline {
             }
             ctx.AdvanceGlobalPtr();
             __syncthreads();
+            Matmul matmul(shm_buf, curr_stage, wid, wtid);
+            matmul.Prefetch(&a, &b);
 
             if (k_idx + i + 2 < k_total) {
                 LoadGlobal<Config, PipelineContext>(ctx, n, k, curr_stage, wid,
@@ -327,7 +335,7 @@ template <class Config> struct MultiStagePipeline {
                                                   tid);
             }
 
-            Matmul::Compute(shm_buf, acc, curr_stage, wid, wtid);
+            matmul.PipelineCompute(&a, &b, acc);
             curr_stage = next_stage;
             next_stage = curr_stage ^ 1;
         }
