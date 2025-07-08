@@ -194,8 +194,8 @@ template <unsigned kReadBatchA>
 __device__ void MatrixALayout<Config>::FetchRegisters(
     uint4 va[Config::kWarpTileM][kReadBatchA], const Shm &__restrict__ shm,
     unsigned tile_idx_m, unsigned tile_idx_k, unsigned wtid) {
-    for (int m = 0; m < Config::kWarpTileM; m++) {
-        for (int j = 0; j < kReadBatchA; j++) {
+    for (int j = 0; j < kReadBatchA; j++) {
+        for (int m = 0; m < Config::kWarpTileM; m++) {
             auto shm_coord =
                 Config::ReadShmCoordA(tile_idx_m + m, tile_idx_k, j, wtid);
             va[m][j] = shm[shm_coord];

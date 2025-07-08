@@ -145,32 +145,32 @@ template <class Config> struct WarpPartitionMatmul {
         const auto bias = DQ::Bias(Config::kHighPrecision);
         const VectorType bias2{bias, bias};
 
-        for (int m = 0; m < Config::kWarpTileM; m++) {
-            // Compute C^T = B^T * A so that the actual accumulation results
-            // are in row-major.
-            for (int j = 0; j < 4; j++) {
-                auto acc_idx = accum_layout(make_coord(warp_idx_n, j));
-                auto va_idx = reg_a_layout(make_coord(j));
+        // Compute C^T = B^T * A so that the actual accumulation results
+        // are in row-major.
+        for (int j = 0; j < 4; j++) {
+            auto acc_idx = accum_layout(make_coord(warp_idx_n, j));
+            auto va_idx = reg_a_layout(make_coord(j));
+            uint q = qw[j];
+            VectorType dq[4];
+            DQ::Dequant(dq, q);
+            DQ::Dequant(dq + 2, q << 8);
+
+            VectorType scale;
+            scale.x = j < 2 ? ds.x : ds.y;
+            scale.y = scale.x;
+
+            for (int i = 0; i < 4; i++) {
+                if constexpr (Config::kHighPrecision) {
+                    dq[i] = fastmath::hmul2(dq[i], bias2);
+                }
+                dq[i] = fastmath::hmul2(dq[i], scale);
+            }
+            static_assert(sizeof(dq) == sizeof(uint4), "");
+            const uint2 *frag_b = reinterpret_cast<const uint2 *>(&dq[0]);
+
+            for (int m = 0; m < Config::kWarpTileM; m++) {
                 const uint2 *va_ptr =
                     reinterpret_cast<const uint2 *>(&va[m][va_idx]);
-                uint q = qw[j];
-                VectorType dq[4];
-                DQ::Dequant(dq, q);
-                DQ::Dequant(dq + 2, q << 8);
-
-                VectorType scale;
-                scale.x = j < 2 ? ds.x : ds.y;
-                scale.y = scale.x;
-
-                for (int i = 0; i < 4; i++) {
-                    if constexpr (Config::kHighPrecision) {
-                        dq[i] = fastmath::hmul2(dq[i], bias2);
-                    }
-                    dq[i] = fastmath::hmul2(dq[i], scale);
-                }
-                static_assert(sizeof(dq) == sizeof(uint4), "");
-                const uint2 *frag_b = reinterpret_cast<const uint2 *>(&dq[0]);
-
                 for (int l = 0; l < 2; l++) {
                     acc[m][acc_idx] =
                         ArchMma::Mma(frag_b[l], va_ptr[l], acc[m][acc_idx]);
