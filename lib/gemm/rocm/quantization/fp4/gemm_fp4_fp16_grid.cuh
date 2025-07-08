@@ -295,11 +295,60 @@ template <class Config> struct SingleStagePipeline {
 
 template <class Config> struct MultiStagePipeline {
     using Matmul = WPMatmul<Config>;
+    using WP = Config::WP;
     using ThreadAccum = Config::ThreadAccum;
 
     static constexpr unsigned kStages = 2;
     static constexpr unsigned kGroupK = Config::kGroupK;
     static constexpr unsigned kGroupSize = Config::kGroupSize;
+
+    __device__ static void HotLoopScheduler() {
+        static constexpr int kSchedGroupId = 0;
+        using Shm = ShmBuf<Config>;
+        static constexpr unsigned kLoadGlobalA = Shm::LayoutA::kLoadGlobalA;
+        static constexpr unsigned kLoadGlobalB = Shm::LayoutB::kLoadGlobalB;
+        static constexpr unsigned kLoadScale = Shm::LayoutScale::kLoadScale;
+
+        static constexpr unsigned kInstGlobals =
+            kLoadGlobalA + kLoadGlobalB + kLoadScale;
+        static constexpr unsigned kInstMFMA =
+            (Config::kGroupM / kTile / WP::kPartitionM) *
+            (Config::kGroupN / kTile / WP::kPartitionN) *
+            (Config::kGroupK / kTile / WP::kPartitionK);
+
+        // The number of instructions required to start the MFMA pipeline
+        static constexpr unsigned kInstLoadForFirstPipeline =
+            kLoadGlobalA + 1 + 1;
+        static constexpr unsigned kInstMFMAPerLoad =
+            kInstMFMA / kInstGlobals > 12
+                ? 4
+                : (kInstMFMA / kInstGlobals > 6 ? 2 : 1);
+
+        // Load A and first B and scales to start the pipeline
+        __builtin_amdgcn_sched_group_barrier(0x100, kInstLoadForFirstPipeline,
+                                             kSchedGroupId);
+
+        // Ideal schedule order: ds_read + ds_write + buffer_load
+        // The heuristics of the instruction scheduler in LLVM fails to schedule
+        // the ds_read, so we do not specify the ds_read in the barrier.
+
+        // ds_write
+        for (int i = 0; i < kInstGlobals; i++) {
+            __builtin_amdgcn_sched_group_barrier(0x200, 1, kSchedGroupId);
+            __builtin_amdgcn_sched_group_barrier(0x8, kInstMFMAPerLoad,
+                                                 kSchedGroupId);
+        }
+
+        // buffer_load
+        for (int i = 0; i < kInstGlobals; i++) {
+            __builtin_amdgcn_sched_group_barrier(0x20, 1, kSchedGroupId);
+            __builtin_amdgcn_sched_group_barrier(0x8, kInstMFMAPerLoad * 2,
+                                                 kSchedGroupId);
+        }
+
+        static_assert(kInstMFMAPerLoad * kInstGlobals <= kInstMFMA, "");
+        __builtin_amdgcn_sched_barrier(0);
+    }
 
     template <class PipelineContext>
     __device__ static void
@@ -312,6 +361,10 @@ template <class Config> struct MultiStagePipeline {
         unsigned curr_stage = 0;
         unsigned next_stage = curr_stage ^ 1;
         LoadGlobal<Config, PipelineContext>(ctx, n, k, curr_stage, wid, tid);
+        __builtin_amdgcn_sched_barrier(~0x20);
+
+        __builtin_amdgcn_s_waitcnt(0 | (7 << 4) | (15 << 8));
+        StoreShm<Config, PipelineContext>(ctx, shm_buf, curr_stage, tid);
 
         if (k_total > 1) {
             ctx.AdvanceGlobalPtr();
@@ -319,13 +372,14 @@ template <class Config> struct MultiStagePipeline {
             LoadGlobal<Config, PipelineContext>(ctx, n, k, next_stage, wid,
                                                 tid);
         }
-        StoreShm<Config, PipelineContext>(ctx, shm_buf, curr_stage, tid);
+
         typename Matmul::DataA a;
         typename Matmul::DataB b;
         Matmul matmul_0(shm_buf, 0, wid, wtid), matmul_1(shm_buf, 1, wid, wtid);
 
         unsigned k_idx = 0;
         for (; k_idx + 3 < k_total; k_idx += 2) {
+            __builtin_amdgcn_sched_barrier(0);
             ctx.AdvanceGlobalPtr();
             __syncthreads();
 
@@ -334,6 +388,8 @@ template <class Config> struct MultiStagePipeline {
             StoreShm<Config, PipelineContext>(ctx, shm_buf, 1, tid);
             matmul_0.PipelineCompute(&a, &b, acc);
 
+            HotLoopScheduler();
+
             ctx.AdvanceGlobalPtr();
             __syncthreads();
 
@@ -341,6 +397,8 @@ template <class Config> struct MultiStagePipeline {
             LoadGlobal<Config, PipelineContext>(ctx, n, k, 1, wid, tid);
             StoreShm<Config, PipelineContext>(ctx, shm_buf, 0, tid);
             matmul_1.PipelineCompute(&a, &b, acc);
+
+            HotLoopScheduler();
         }
 
 #pragma unroll
