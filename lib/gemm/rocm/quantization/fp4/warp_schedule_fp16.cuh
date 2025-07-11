@@ -49,9 +49,7 @@ template <class Config> struct WarpPartitionMatmul {
     using LayoutA = MatrixALayout<Config>;
     using LayoutB = MatrixBLayout<Config>;
     using Partition = typename Config::WP;
-    static constexpr unsigned kBatchA =
-        kPackFactor * (sizeof(uint4) / sizeof(unsigned)) /
-        sizeof(typename Config::ElementA) / sizeof(unsigned);
+    static constexpr unsigned kBatchA = Config::WarpMatmulLayout::kReadBatchA;
 
     static_assert(Config::kGroupK / Config::kLayoutM / Partition::kPartitionK >
                       0,
@@ -131,11 +129,14 @@ template <class Config> struct WarpPartitionMatmul {
     __device__ void Matmul(const DataA &va, const DataB &b,
                            typename Config::ThreadAccum &__restrict__ acc,
                            unsigned warp_idx_n) {
+        using causalflow::tal::make_coord;
         using ArchMma =
             MmaSelector<typename Config::ElementA, Config::kHighPrecision>;
         using DQ = ArchMma::DQ;
         using DS = ArchMma::DS;
         using VectorType = DQ::VectorType;
+        typename Config::WarpAccumLayout accum_layout;
+        typename Config::WarpMatmulRegALayout reg_a_layout;
 
         VectorType ds;
         DS::DequantFullScale(&ds, b.packed_scales);
@@ -148,8 +149,10 @@ template <class Config> struct WarpPartitionMatmul {
             // Compute C^T = B^T * A so that the actual accumulation results
             // are in row-major.
             for (int j = 0; j < 4; j++) {
+                auto acc_idx = accum_layout(make_coord(warp_idx_n, j));
+                auto va_idx = reg_a_layout(make_coord(j));
                 const uint2 *va_ptr =
-                    reinterpret_cast<const uint2 *>(&va[m][j]);
+                    reinterpret_cast<const uint2 *>(&va[m][va_idx]);
                 uint q = qw[j];
                 VectorType dq[4];
                 DQ::Dequant(dq, q);
@@ -169,8 +172,8 @@ template <class Config> struct WarpPartitionMatmul {
                 const uint2 *frag_b = reinterpret_cast<const uint2 *>(&dq[0]);
 
                 for (int l = 0; l < 2; l++) {
-                    acc[m][warp_idx_n] =
-                        ArchMma::Mma(frag_b[l], va_ptr[l], acc[m][warp_idx_n]);
+                    acc[m][acc_idx] =
+                        ArchMma::Mma(frag_b[l], va_ptr[l], acc[m][acc_idx]);
                 }
             }
         }

@@ -224,7 +224,7 @@ Fp4Hp(MatmulPipeline pipeline, MatmulMfmaType mfma_type, unsigned tile_m,
     TEST_F(                                                                         \
         GemmFp4Fp16Test,                                                            \
         TestGemm_##m##x##n##x##k##_##partition_m##x##partition_n##x##partition_k) { \
-        TestGemm(m, n, k, 1.0f,                                                     \
+        TestGemm(m, std::lcm(n, 32), std::lcm(k, 256), 1.0f,                        \
                  Fp4Bf16(m / 16, n / 16, k / 16, partition_m, partition_n,          \
                          partition_k));                                             \
     }
@@ -239,7 +239,7 @@ TEST_F(GemmFp4Fp16Test, TestGemm16x32x256Fp16HighPrecision) {
 
 TEST_F(GemmFp4Fp16Test, TestGemm_64x16x128_4x1x1_Pipeline) {
     for (auto k : {256, 512, 768, 1024}) {
-        TestGemm(64, 16, k, 1.0f,
+        TestGemm(64, 32, k, 1.0f,
                  Fp4MNK(MatmulFeatures::kMatmulFeatures_Grid,
                         MatmulPipeline::kMatmulPipeline_2,
                         MatmulMfmaType::kMatmulMfmaTypeBf16, 4, 1, 8, 4, 1, 1));

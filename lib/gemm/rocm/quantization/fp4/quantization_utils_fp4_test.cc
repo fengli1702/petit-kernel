@@ -124,11 +124,11 @@ class NvFp4ToPetitFp4Test : public ::testing::Test {
 };
 
 TEST_F(NvFp4ToPetitFp4Test, TestLayout128x16Bf16) {
-    TestConvert<hip_bfloat16, 256, 512>(1.0, kDataTypeBf16);
+    TestConvert<hip_bfloat16, 512, 512>(1.0, kDataTypeBf16);
 }
 
 TEST_F(NvFp4ToPetitFp4Test, TestLayout128x16Fp16) {
-    TestConvert<half, 256, 512>(1.0, kDataTypeFp16);
+    TestConvert<half, 512, 512>(1.0, kDataTypeFp16);
 }
 
 } // namespace causalflow::petit::rocm::quantization::fp4

@@ -64,6 +64,16 @@ template <class TS, class WP> struct WarpMatmulLayoutTrait {
                   "dimensions");
 
     using ThreadAccum = float4[kWarpTileM][kThreadAccumTileNRegs];
+    using WarpAccumLayout = tal::Layout<
+        tal::Shape<tal::C<kWarpAtomN>,
+                   tal::Shape<tal::C<DiskLayout::kLayoutElementsM>,
+                              tal::C<4 / DiskLayout::kLayoutElementsM>>>,
+        tal::Stride<tal::C<kAccTilePerThread>, tal::Stride<tal::_0, tal::_1>>>;
+    using WarpMatmulRegALayout = tal::Layout<
+        tal::Shape<tal::Shape<tal::C<DiskLayout::kLayoutElementsM>,
+                              tal::C<4 / DiskLayout::kLayoutElementsM>>>,
+        tal::Stride<tal::Stride<tal::_1, tal::_0>>>;
+
     static constexpr unsigned kLayoutElementsM = DiskLayout::kLayoutElementsM;
     static constexpr unsigned kReadBatchA = DiskLayout::kLayoutElementsM *
                                             kPackFactor * sizeof(ElementA) /
@@ -151,6 +161,9 @@ struct GEMMFp4Fp16Config {
     static constexpr unsigned kThreadAccumTileNRegs =
         WarpMatmulLayout::kThreadAccumTileNRegs;
     using ThreadAccum = typename WarpMatmulLayout::ThreadAccum;
+    using WarpAccumLayout = typename WarpMatmulLayout::WarpAccumLayout;
+    using WarpMatmulRegALayout =
+        typename WarpMatmulLayout::WarpMatmulRegALayout;
 
     __device__ static inline unsigned WriteShmCoordA(unsigned tid,
                                                      unsigned steps) {
