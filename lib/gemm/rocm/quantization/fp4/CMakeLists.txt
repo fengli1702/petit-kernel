@@ -3,7 +3,7 @@ target_link_libraries(quantization_utils_fp4_rocm_test causalflow-petit-rocm-qua
 add_test(quantization_utils_fp4_rocm_test quantization_utils_fp4_rocm_test)
 
 add_executable(gemm_fp4_fp16_rocm_test gemm_fp4_fp16_rocm_test.cc)
-target_link_libraries(gemm_fp4_fp16_rocm_test causalflow-petit-rocm-quantization causalflow-petit-tests roc::hipblaslt GTest::gtest_main)
+target_link_libraries(gemm_fp4_fp16_rocm_test causalflow-petit-rocm-quantization causalflow-petit-tests roc::hipblaslt GTest::gmock GTest::gtest_main)
 add_test(gemm_fp4_fp16_rocm_test gemm_fp4_fp16_rocm_test)
 
 add_executable(gemm_fp4_fp16_gen_solution_list gen_solution_list.cc)

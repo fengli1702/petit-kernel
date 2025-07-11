@@ -28,9 +28,21 @@ struct QWeightOnDiskLayout128x16 {
     static_assert(kLayoutElementsM * kLayoutElementsN == 4, "");
 };
 
+struct QWeightOnDiskLayout64x32 {
+    // kLayoutM is dimension K
+    static constexpr unsigned kLayoutM = 64;
+    static constexpr unsigned kLayoutN = 32;
+
+    // How many consecutive elements on the (m,n) orders
+    static constexpr unsigned kLayoutElementsM = 2;
+    static constexpr unsigned kLayoutElementsN = 2;
+    static_assert(kLayoutElementsM * kLayoutElementsN == 4, "");
+};
+
 template <class TS, class WP> struct WarpMatmulLayoutTrait {
     using ElementA = typename TS::ElementA;
-    using DiskLayout = QWeightOnDiskLayout128x16;
+    // using DiskLayout = QWeightOnDiskLayout128x16;
+    using DiskLayout = QWeightOnDiskLayout64x32;
     static constexpr unsigned kLayoutM = DiskLayout::kLayoutM;
     static constexpr unsigned kLayoutN = DiskLayout::kLayoutN;
     static constexpr unsigned kGroupK = TS::kGroupK;
@@ -46,8 +58,11 @@ template <class TS, class WP> struct WarpMatmulLayoutTrait {
     static constexpr unsigned kWarpAtomK = kGroupK / kLayoutM / WP::kPartitionK;
     static constexpr unsigned kWarpAtomN =
         TS::kGroupN / kLayoutN / WP::kPartitionN;
-    static_assert(kWarpAtomK > 0, "");
-    static_assert(kWarpAtomN > 0, "");
+    static_assert(kGroupK % (kLayoutM * WP::kPartitionK) == 0 && kWarpAtomK > 0,
+                  "");
+    static_assert(TS::kGroupN % (kLayoutN * WP::kPartitionN) == 0 &&
+                      kWarpAtomN > 0,
+                  "");
 
     // Determine by the data layout and how the 4-uint quantized weights are
     // arranged.

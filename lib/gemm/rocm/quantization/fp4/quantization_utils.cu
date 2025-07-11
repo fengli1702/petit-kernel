@@ -429,7 +429,8 @@ int DequantNvFp4(unsigned *output, const unsigned *input,
 int DequantPetitFp4(unsigned *output, const unsigned *input,
                     const unsigned *scales, float global_scale,
                     DataType out_type, unsigned k, unsigned n) {
-    using Layout = RepackQWeightLayout128x16;
+    // using Layout = RepackQWeightLayout128x16;
+    using Layout = RepackQWeightLayout64x32;
     dim3 grid(k / Layout::kGroupM, n / Layout::kGroupN);
     dim3 block(Layout::kNumWarps * kWarpSize);
     if (k % Layout::kGroupM != 0 || n % Layout::kGroupN != 0) {
@@ -461,7 +462,8 @@ int DequantPetitFp4(unsigned *output, const unsigned *input,
 void RepackNvFp4ToPetitFp4Weights(unsigned *output, const unsigned *input,
                                   unsigned in_chan, unsigned out_chan,
                                   hipStream_t stream) {
-    using Layout = RepackQWeightLayout128x16;
+    // using Layout = RepackQWeightLayout128x16;
+    using Layout = RepackQWeightLayout64x32;
     dim3 grid(in_chan / Layout::kGroupM, out_chan / Layout::kGroupN);
     dim3 block(Layout::kNumWarps * kWarpSize);
 
@@ -479,7 +481,8 @@ void RepackNvFp4ToPetitFp4Weights(unsigned *output, const unsigned *input,
 void RepackNvFp4ToPetitFp4Scales(unsigned *out_scales, const unsigned *scales,
                                  unsigned in_chan, unsigned out_chan,
                                  hipStream_t stream) {
-    using ScaleLayout = RepackScaleLayout128x16;
+    // using ScaleLayout = RepackScaleLayout128x16;
+    using ScaleLayout = RepackScaleLayout64x32;
     static constexpr unsigned kGroupM = ScaleLayout::kGroupM;
     static constexpr unsigned kGroupN = ScaleLayout::kGroupN;
     dim3 scale_grid(in_chan / kGroupM, out_chan / kGroupN);

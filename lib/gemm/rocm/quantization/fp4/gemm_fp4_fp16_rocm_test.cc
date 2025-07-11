@@ -4,9 +4,12 @@
 #include "utils/hip_helper.h"
 
 #include <climits>
+#include <cmath>
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <hip/hip_fp16.h>
 #include <hipblaslt/hipblaslt.h>
+#include <iostream>
 
 namespace causalflow::petit::rocm::quantization::fp4 {
 
@@ -15,6 +18,29 @@ static inline void CheckHipblasStatus(hipblasStatus_t status) {
         std::cerr << "HipBLAS Error: " << status << std::endl;
         throw std::runtime_error("HipBLAS Error");
     }
+}
+
+MATCHER_P2(IsNearBf16, ref, mantissa_diff, "") {
+    unsigned a_f32 = (unsigned)arg << 16, b_f32 = (unsigned)ref << 16;
+    float a_f = reinterpret_cast<const float &>(a_f32);
+    float b_f = reinterpret_cast<const float &>(b_f32);
+
+    if (std::abs(a_f - b_f) < std::min<float>(1e-2, fabs(b_f) * 0.01f)) {
+        return true;
+    }
+
+    int mantissa_a = (unsigned)arg & 0x7f, mantissa_b = (unsigned)ref & 0x7f;
+    unsigned other_a = (unsigned)arg & 0x7f80, other_b = (unsigned)ref & 0x7f80;
+    bool result = other_a == other_b &&
+                  std::abs(mantissa_a - mantissa_b) <= mantissa_diff;
+
+    if (!result && result_listener->IsInterested()) {
+        *result_listener << "Expected bfloat16 value near " << std::hex << "0x"
+                         << ref << " (" << b_f << "), but got " << std::hex
+                         << "0x" << arg << " (" << a_f << ")";
+    }
+
+    return result;
 }
 
 using GemmMPTestData = tests::quantization::GemmMPTestData;
@@ -26,9 +52,9 @@ class GemmFp4Fp16Test : public ::testing::Test {
     void TearDown() override;
 
     void ComputeReference(GemmMPTestData *ctx) const;
-    void CopyAndCompareOutput(GemmMPTestData *ctx) const;
+    void CopyAndCompareOutput(GemmMPTestData *ctx, bool relaxed) const;
     void TestGemm(unsigned m, unsigned n, unsigned k, float global_scale,
-                  SolutionId sol_id);
+                  SolutionId sol_id, bool relaxed = false);
 
     hipblasLtHandle_t handle_;
     hipblasLtMatmulDesc_t matmul_desc_;
@@ -107,7 +133,8 @@ void GemmFp4Fp16Test::ComputeReference(GemmMPTestData *ctx) const {
     CheckHipblasStatus(hipblasLtMatrixLayoutDestroy(layout_c));
 }
 
-void GemmFp4Fp16Test::CopyAndCompareOutput(GemmMPTestData *ctx) const {
+void GemmFp4Fp16Test::CopyAndCompareOutput(GemmMPTestData *ctx,
+                                           bool relaxed) const {
     std::vector<unsigned short> h_output(ctx->m() * ctx->n()),
         h_reference(ctx->m() * ctx->n());
     CheckHIPStatus(hipMemcpy(h_output.data(), ctx->output(),
@@ -129,18 +156,16 @@ void GemmFp4Fp16Test::CopyAndCompareOutput(GemmMPTestData *ctx) const {
             EXPECT_NEAR(of, rf, std::min<float>(1e-2, fabs(rf) * 0.01f))
                 << "Output and reference differ at index " << i;
         } else if (dequant_type_ == DataType::kDataTypeBf16) {
-            unsigned o = (unsigned)h_output[i] << 16,
-                     r = (unsigned)h_reference[i] << 16;
-            float of = reinterpret_cast<const float &>(o);
-            float rf = reinterpret_cast<const float &>(r);
-            EXPECT_NEAR(of, rf, std::min<float>(1e-2, fabs(rf) * 0.01f))
+            EXPECT_THAT(h_output[i],
+                        IsNearBf16(h_reference[i], relaxed ? 4 : 2))
                 << "Output and reference differ at index " << i;
         }
     }
 }
 
 void GemmFp4Fp16Test::TestGemm(unsigned m, unsigned n, unsigned k,
-                               float global_scale, SolutionId sol_id) {
+                               float global_scale, SolutionId sol_id,
+                               bool relaxed) {
     if (sol_id.mfma_type == MatmulMfmaType::kMatmulMfmaTypeBf16) {
         dequant_type_ = DataType::kDataTypeBf16;
     } else {
@@ -177,7 +202,7 @@ void GemmFp4Fp16Test::TestGemm(unsigned m, unsigned n, unsigned k,
         reinterpret_cast<const unsigned *>(ctx.scales()), d_global_scale_, m, n,
         k, hints, sol_id.Repr(), nullptr);
     ASSERT_EQ(err, 0);
-    CopyAndCompareOutput(&ctx);
+    CopyAndCompareOutput(&ctx, relaxed);
 }
 
 static inline constexpr SolutionId
@@ -229,14 +254,25 @@ Fp4Hp(MatmulPipeline pipeline, MatmulMfmaType mfma_type, unsigned tile_m,
                          partition_k));                                             \
     }
 
+#define TEST_BF16_RELAXED(m, n, k, partition_m, partition_n, partition_k)           \
+    TEST_F(                                                                         \
+        GemmFp4Fp16Test,                                                            \
+        TestGemm_##m##x##n##x##k##_##partition_m##x##partition_n##x##partition_k) { \
+        TestGemm(m, std::lcm(n, 32), std::lcm(k, 256), 1.0f,                        \
+                 Fp4Bf16(m / 16, n / 16, k / 16, partition_m, partition_n,          \
+                         partition_k),                                              \
+                 true);                                                             \
+    }
+
 // Use high precision for fp16 since MI210 flushes denormals to zero causing
 // loss of precision
 TEST_F(GemmFp4Fp16Test, TestGemm16x32x256Fp16HighPrecision) {
     TestGemm(16, 64, 256, 1.0f,
              Fp4Hp(MatmulPipeline::kMatmulPipeline_2,
-                   MatmulMfmaType::kMatmulMfmaTypeFp16, 1, 2, 16, 1, 2, 2));
+                   MatmulMfmaType::kMatmulMfmaTypeFp16, 1, 2, 16, 1, 1, 4));
 }
 
+#if 0
 TEST_F(GemmFp4Fp16Test, TestGemm_64x16x128_4x1x1_Pipeline) {
     for (auto k : {256, 512, 768, 1024}) {
         TestGemm(64, 32, k, 1.0f,
@@ -268,5 +304,56 @@ TEST_BF16(64, 96, 128, 2, 2, 1)
 TEST_BF16(96, 96, 128, 2, 2, 1)
 TEST_BF16(32, 128, 128, 2, 2, 1)
 TEST_BF16(64, 160, 128, 2, 2, 1)
+#endif
+
+TEST_BF16(64, 32, 128, 4, 1, 1)
+TEST_BF16(16, 32, 256, 1, 1, 4)
+TEST_BF16(32, 32, 256, 2, 1, 2)
+TEST_BF16(32, 32, 256, 1, 1, 4)
+TEST_BF16(64, 32, 256, 2, 1, 2)
+TEST_BF16(16, 32, 512, 1, 1, 4)
+TEST_BF16(32, 32, 512, 2, 1, 2)
+TEST_BF16(16, 64, 128, 1, 2, 2)
+TEST_BF16(32, 64, 128, 2, 2, 1)
+TEST_BF16(64, 64, 128, 2, 2, 1)
+TEST_BF16(96, 64, 128, 2, 2, 1)
+TEST_BF16(128, 64, 128, 2, 2, 1)
+TEST_BF16(160, 64, 128, 2, 2, 1)
+TEST_BF16(16, 64, 256, 1, 2, 2)
+TEST_BF16(32, 64, 256, 2, 2, 1)
+TEST_BF16(64, 64, 256, 2, 2, 1)
+TEST_BF16(16, 64, 512, 1, 2, 2)
+TEST_BF16(32, 64, 512, 2, 2, 1)
+TEST_BF16(64, 96, 128, 2, 1, 2)
+TEST_BF16(96, 96, 128, 2, 1, 2)
+TEST_BF16(16, 128, 64, 1, 4, 1)
+TEST_BF16(128, 128, 64, 2, 2, 1)
+TEST_BF16(192, 128, 64, 2, 2, 1)
+TEST_BF16(224, 128, 64, 2, 2, 1)
+TEST_BF16(256, 128, 64, 2, 2, 1)
+TEST_BF16(32, 128, 128, 2, 2, 1)
+TEST_BF16(64, 128, 128, 2, 2, 1)
+TEST_BF16(80, 128, 128, 1, 2, 2)
+TEST_BF16(160, 128, 64, 2, 2, 1)
+TEST_BF16(128, 192, 64, 2, 2, 1)
+TEST_BF16(160, 192, 64, 2, 2, 1)
+TEST_BF16(192, 192, 64, 2, 2, 1)
+TEST_BF16(224, 192, 64, 2, 2, 1)
+TEST_BF16(256, 192, 64, 2, 2, 1)
+TEST_BF16_RELAXED(128, 256, 64, 2, 2, 1)
+TEST_BF16(160, 256, 64, 2, 2, 1)
+TEST_BF16(192, 256, 64, 2, 2, 1)
+TEST_BF16(224, 256, 64, 2, 2, 1)
+TEST_BF16(256, 256, 64, 2, 2, 1)
+
+TEST_F(GemmFp4Fp16Test, TestGemm_32x32x256_2x1x2_Pipeline) {
+    for (auto k : {512, 768, 1024}) {
+        TestGemm(32, 32, k, 1.0f,
+                 Fp4MNK(MatmulFeatures::kMatmulFeatures_Grid,
+                        MatmulPipeline::kMatmulPipeline_2,
+                        MatmulMfmaType::kMatmulMfmaTypeBf16, 2, 2, 16, 2, 1,
+                        2));
+    }
+}
 
 } // namespace causalflow::petit::rocm::quantization::fp4

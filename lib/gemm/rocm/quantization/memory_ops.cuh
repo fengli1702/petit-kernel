@@ -137,7 +137,7 @@ template <class Config> struct ShmBuf {
     static constexpr unsigned kMaxResultMTilePerPartition = std::min<unsigned>(
         Config::kWarpTileM,
         kMaxShmSize /
-            (kGroupN * sizeof(half) * Config::kTile / Config::WP::kPartitionM));
+            (kGroupN * sizeof(half) * Config::kTile * Config::WP::kPartitionM));
 
     // Try to balance the reduction to save overheads of calculating the
     // addresses.

@@ -16,8 +16,8 @@ DEFINE_string(output_dir, "", "Output directory of individual kernel files");
 namespace causalflow::petit::rocm::quantization::fp4 {
 
 struct TileShapeAndWarpPartition {
-    unsigned tile_m : 4;
-    unsigned tile_n : 4;
+    unsigned tile_m : 8;
+    unsigned tile_n : 8;
     unsigned tile_k : 8;
     unsigned warp_partition_m : 4;
     unsigned warp_partition_n : 4;
@@ -27,19 +27,29 @@ struct TileShapeAndWarpPartition {
 using TSWP = TileShapeAndWarpPartition;
 
 static constexpr unsigned kTile = 16;
-static constexpr unsigned kLayoutM = 128;
-static constexpr unsigned kLayoutN = 16;
+static constexpr unsigned kLayoutM = 64;
+static constexpr unsigned kLayoutN = 32;
 
 // TileShapeAndWarpPartition, order by (n, k, m)
 static constexpr TSWP kTSWP[] = {
-    {4, 1, 8, 4, 1, 1},  {4, 1, 16, 2, 1, 2}, {1, 1, 32, 1, 1, 4},
-    {2, 1, 32, 2, 1, 2}, {4, 2, 8, 2, 2, 1},  {1, 2, 16, 1, 2, 2},
-    {2, 2, 16, 1, 2, 2}, {4, 2, 16, 1, 2, 2}, {2, 3, 16, 2, 1, 2},
-    {4, 3, 8, 4, 1, 1},  {4, 3, 16, 4, 1, 1}, {1, 4, 8, 1, 4, 1},
-    {2, 4, 8, 2, 2, 1},  {4, 4, 8, 2, 2, 1},  {8, 4, 8, 2, 2, 1},
-    {1, 4, 16, 1, 2, 2}, {1, 4, 32, 1, 2, 2}, {2, 4, 32, 2, 2, 1},
-    {8, 5, 8, 4, 1, 1},  {4, 6, 8, 2, 2, 1},  {6, 6, 8, 2, 2, 1},
-    {2, 8, 8, 2, 2, 1},  {4, 10, 8, 2, 2, 1},
+    {4, 2, 8, 4, 1, 1},   {1, 2, 16, 1, 1, 4},  {2, 2, 16, 2, 1, 2},
+    {2, 2, 16, 1, 1, 4},  {4, 2, 16, 2, 1, 2},  {1, 2, 32, 1, 1, 4},
+    {2, 2, 32, 2, 1, 2},
+
+    {1, 4, 8, 1, 2, 2},   {2, 4, 8, 2, 2, 1},   {4, 4, 8, 2, 2, 1},
+    {6, 4, 8, 2, 2, 1},   {8, 4, 8, 2, 2, 1},   {10, 4, 8, 2, 2, 1},
+    {1, 4, 16, 1, 2, 2},  {2, 4, 16, 2, 2, 1},  {4, 4, 16, 2, 2, 1},
+    {1, 4, 32, 1, 2, 2},  {2, 4, 32, 2, 2, 1},
+
+    {4, 6, 8, 2, 1, 2},   {6, 6, 8, 2, 1, 2},   {1, 8, 4, 1, 4, 1},
+    {8, 8, 4, 2, 2, 1},   {12, 8, 4, 2, 2, 1},  {14, 8, 4, 2, 2, 1},
+    {16, 8, 4, 2, 2, 1},  {2, 8, 8, 2, 2, 1},   {4, 8, 8, 2, 2, 1},
+    {5, 8, 8, 1, 2, 2},   {10, 8, 4, 2, 2, 1},
+
+    {8, 12, 4, 2, 2, 1},  {10, 12, 4, 2, 2, 1}, {12, 12, 4, 2, 2, 1},
+    {14, 12, 4, 2, 2, 1}, {16, 12, 4, 2, 2, 1}, {8, 16, 4, 2, 2, 1},
+    {10, 16, 4, 2, 2, 1}, {12, 16, 4, 2, 2, 1}, {14, 16, 4, 2, 2, 1},
+    {16, 16, 4, 2, 2, 1},
 };
 
 static MatmulPipeline GetPipelineStage(const TSWP &tswp) {
