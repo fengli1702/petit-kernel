@@ -57,9 +57,9 @@ unsigned long ChooseDefaultFp4Fp16Solution(unsigned m, unsigned n, unsigned k,
 
     auto is_available = [&](const SolutionId &sol) {
         unsigned group_n = sol.tile_n * kTile, group_k = sol.tile_k * 64;
-        bool is_high_precision =
-            (sol.features & MatmulFeatures::kMatmulFeatures_HighPrecision) != 0;
-        return (hints.require_high_precision ^ is_high_precision) &&
+        bool not_high_precision =
+            (sol.features & MatmulFeatures::kMatmulFeatures_HighPrecision) == 0;
+        return (hints.require_high_precision ^ not_high_precision) &&
                ((sol.mfma_type == MatmulMfmaType::kMatmulMfmaTypeFp16 &&
                  hints.a_type == DataType::kDataTypeFp16) ||
                 (sol.mfma_type == MatmulMfmaType::kMatmulMfmaTypeBf16 &&
