@@ -7,7 +7,7 @@ namespace causalflow::petit::rocm::quantization::fp4 {
 template <unsigned long kRepr>
 int SolutionAdapter<kRepr>::Invoke(unsigned *c, const unsigned *a,
                                    const unsigned *b, const unsigned *scales,
-                                   float global_scale, const unsigned m,
+                                   const float *global_scale, const unsigned m,
                                    const unsigned n, const unsigned k,
                                    hipStream_t stream) {
     static constexpr SolutionId kSolId = SolutionId::FromRepr(kRepr);

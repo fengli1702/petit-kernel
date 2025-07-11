@@ -276,8 +276,9 @@ __launch_bounds__(Config::kThreads) __global__
                                const uint4 *__restrict__ A,
                                const uint4 *__restrict__ B,
                                const uint4 *__restrict__ scales,
-                               float global_scale, const unsigned m,
-                               const unsigned n, const unsigned k) {
+                               const float *__restrict__ global_scale_ptr,
+                               const unsigned m, const unsigned n,
+                               const unsigned k) {
     static constexpr unsigned kGroupM = Config::kGroupM;
     static constexpr unsigned kGroupN = Config::kGroupN;
     static constexpr unsigned kGroupNInts = kGroupN / kPackFactor;
@@ -296,6 +297,10 @@ __launch_bounds__(Config::kThreads) __global__
     using Pipeline =
         std::conditional_t<Config::kStages == 1, SingleStagePipeline<Config>,
                            MultiStagePipeline<Config>>;
+    using ArchMma =
+        MmaSelector<typename Config::ElementA, Config::kHighPrecision>;
+    using DS = ArchMma::DS;
+    float global_scale = *global_scale_ptr * DS::GlobalScaleFactor();
 
     [[assume(tid < Config::kThreads)]];
 
@@ -364,10 +369,9 @@ template <SolutionId id> struct ConfigSelector {
     static constexpr unsigned kNumWarps = WP::kNumWarps;
 
     static int Invoke(unsigned *c, const unsigned *a, const unsigned *b,
-                      const unsigned *scales, float global_scale,
+                      const unsigned *scales, const float *global_scale,
                       const unsigned m, const unsigned n, const unsigned k,
                       hipStream_t stream) {
-        global_scale *= DS::GlobalScaleFactor();
 
         uint4 *c4 = reinterpret_cast<uint4 *>(c);
         const uint4 *a4 = reinterpret_cast<const uint4 *>(a);

@@ -103,9 +103,9 @@ torch::Tensor ProcessNvFp4Scales(torch::Tensor &scales, int64_t size_n,
 }
 
 torch::Tensor MulFp4A16(const torch::Tensor &A, const torch::Tensor &B,
-                        const torch::Tensor &s, float global_scale,
-                        int64_t size_m, int64_t size_n, int64_t size_k,
-                        int64_t solution_id) {
+                        const torch::Tensor &s,
+                        const torch::Tensor &global_scale, int64_t size_m,
+                        int64_t size_n, int64_t size_k, int64_t solution_id) {
     int groupsize = size_k / s.size(1);
     if (groupsize != 16) {
         AT_ERROR("Only groupsize = 16 is supported. size_k = ", size_k,
@@ -140,12 +140,13 @@ torch::Tensor MulFp4A16(const torch::Tensor &A, const torch::Tensor &B,
         hints.require_high_precision = require_high_precision;
     }
 
-    int err = GemmFp4Fp16Grid(reinterpret_cast<unsigned *>(c.data_ptr()),
-                              reinterpret_cast<const unsigned *>(A.data_ptr()),
-                              reinterpret_cast<const unsigned *>(B.data_ptr()),
-                              reinterpret_cast<const unsigned *>(s.data_ptr()),
-                              global_scale, size_m, size_n, size_k, hints,
-                              solution_id, at::hip::getCurrentHIPStream(dev));
+    int err = GemmFp4Fp16Grid(
+        reinterpret_cast<unsigned *>(c.data_ptr()),
+        reinterpret_cast<const unsigned *>(A.data_ptr()),
+        reinterpret_cast<const unsigned *>(B.data_ptr()),
+        reinterpret_cast<const unsigned *>(s.data_ptr()),
+        reinterpret_cast<const float *>(global_scale.data_ptr()), size_m,
+        size_n, size_k, hints, solution_id, at::hip::getCurrentHIPStream(dev));
 
     if (err == kErrorProblemShape) {
         AT_ERROR("Incompatible problem shape (m=", size_m, ", n=", size_n,

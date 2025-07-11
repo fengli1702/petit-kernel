@@ -33,6 +33,7 @@ class GemmFp4Fp16Test : public ::testing::Test {
     hipblasLtHandle_t handle_;
     hipblasLtMatmulDesc_t matmul_desc_;
     void *d_workspace_;
+    float *d_global_scale_;
     std::unique_ptr<hal::Device> dev_;
     DataType dequant_type_;
 };
@@ -40,6 +41,7 @@ class GemmFp4Fp16Test : public ::testing::Test {
 void GemmFp4Fp16Test::SetUp() {
     static constexpr hipblasOperation_t kTransposed = HIPBLAS_OP_T;
     CheckHIPStatus(hipMalloc(&d_workspace_, kWorkspaceSize));
+    CheckHIPStatus(hipMalloc(&d_global_scale_, sizeof(float)));
 
     CheckHipblasStatus(hipblasLtCreate(&handle_));
     CheckHipblasStatus(hipblasLtMatmulDescCreate(
@@ -147,6 +149,8 @@ void GemmFp4Fp16Test::TestGemm(unsigned m, unsigned n, unsigned k,
     GemmMPTestData ctx(dev_.get(), dequant_type_, DataType::kDataTypeFp4e2m1, m,
                        n, k, 16);
     ASSERT_EQ(absl::OkStatus(), ctx.PrepareData(false));
+    CheckHIPStatus(hipMemcpy(d_global_scale_, &global_scale, sizeof(float),
+                             hipMemcpyHostToDevice));
 
     DequantPetitFp4(reinterpret_cast<unsigned *>(ctx.weights()),
                     reinterpret_cast<const unsigned *>(ctx.weights_quant()),
@@ -164,12 +168,12 @@ void GemmFp4Fp16Test::TestGemm(unsigned m, unsigned n, unsigned k,
     hints.require_high_precision =
         sol_id.features & MatmulFeatures::kMatmulFeatures_HighPrecision;
 
-    int err =
-        GemmFp4Fp16Grid(reinterpret_cast<unsigned *>(ctx.output()),
-                        reinterpret_cast<const unsigned *>(ctx.input()),
-                        reinterpret_cast<const unsigned *>(ctx.weights_quant()),
-                        reinterpret_cast<const unsigned *>(ctx.scales()),
-                        global_scale, m, n, k, hints, sol_id.Repr(), nullptr);
+    int err = GemmFp4Fp16Grid(
+        reinterpret_cast<unsigned *>(ctx.output()),
+        reinterpret_cast<const unsigned *>(ctx.input()),
+        reinterpret_cast<const unsigned *>(ctx.weights_quant()),
+        reinterpret_cast<const unsigned *>(ctx.scales()), d_global_scale_, m, n,
+        k, hints, sol_id.Repr(), nullptr);
     ASSERT_EQ(err, 0);
     CopyAndCompareOutput(&ctx);
 }

@@ -27,7 +27,7 @@ def mul_fp4_a16(
     a: torch.Tensor,
     b: torch.Tensor,
     s: torch.Tensor,
-    global_scale: float,
+    global_scale: torch.Tensor,
     size_m: int,
     size_n: int,
     size_k: int,

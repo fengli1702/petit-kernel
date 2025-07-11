@@ -115,7 +115,7 @@ struct PetitSolutionHints {
 
 namespace fp4 {
 int GemmFp4Fp16Grid(unsigned *c, const unsigned *a, const unsigned *b,
-                    const unsigned *scales, float global_scale,
+                    const unsigned *scales, const float *global_scale,
                     const unsigned m, const unsigned n, const unsigned k,
                     const PetitSolutionHints &hints, unsigned long solution_id,
                     hipStream_t stream);

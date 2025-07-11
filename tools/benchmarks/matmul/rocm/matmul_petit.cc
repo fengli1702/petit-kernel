@@ -80,6 +80,7 @@ class PetitMatmulFp4Base : public Matmul {
     const void *d_a_, *d_b_;
     unsigned *d_b_quant_, *d_scales_;
     void *d_workspace_;
+    float *d_global_scale_;
     int batch_;
     SolutionId algo_;
     std::vector<SolutionId> available_sols_;
@@ -108,8 +109,8 @@ class PetitMatmulFp4Fp16 : public PetitMatmulFp4Base {
                         b * stride_a_ / (sizeof(unsigned) / sizeof(ElementA)),
                     reinterpret_cast<const unsigned *>(d_b_quant_) +
                         b * stride_b_quant_ / sizeof(unsigned),
-                    d_scales_ + b * stride_scales_ / sizeof(unsigned), 1.0f, m_,
-                    n_, k_, hints_, algo_.Repr(), nullptr);
+                    d_scales_ + b * stride_scales_ / sizeof(unsigned),
+                    d_global_scale_, m_, n_, k_, hints_, algo_.Repr(), nullptr);
             }
         }
         return absl::OkStatus();
@@ -122,7 +123,7 @@ class PetitMatmulFp4Fp16 : public PetitMatmulFp4Base {
 PetitMatmulFp4Base::PetitMatmulFp4Base(int m, int n, int k, DataType a_type,
                                        int groupsize)
     : m_(m), n_(n), k_(k), groupsize_(groupsize), d_b_quant_(nullptr),
-      d_scales_(nullptr) {
+      d_scales_(nullptr), d_global_scale_(nullptr) {
     static constexpr unsigned kMaxSols = 1024;
     available_sols_.resize(kMaxSols);
     unsigned available_sols_count = available_sols_.size();
@@ -143,6 +144,7 @@ PetitMatmulFp4Base::PetitMatmulFp4Base(int m, int n, int k, DataType a_type,
 absl::Status PetitMatmulFp4Base::PrepareForBatchExecution(
     void *d, const void *a, const void *b, const void *c, long stride_a,
     long stride_b, long stride_c, int batch) {
+    static constexpr float kGlobalScale = 1.0f;
 
     // Check alignment requirements
     if (n_ % 16 != 0 || k_ % groupsize_ != 0) {
@@ -161,6 +163,7 @@ absl::Status PetitMatmulFp4Base::PrepareForBatchExecution(
     stride_c_ = stride_c;
 
     FreeQuantizedMemory();
+    CheckHIPStatus(hipMalloc(&d_global_scale_, sizeof(float)));
     CheckHIPStatus(hipMalloc(&d_b_quant_, n_ * k_ * batch_ / 2));
     CheckHIPStatus(hipMalloc(&d_scales_, n_ * k_ * batch_ / groupsize_ *
                                              sizeof(unsigned char)));
@@ -177,6 +180,8 @@ absl::Status PetitMatmulFp4Base::PrepareForBatchExecution(
     CheckHIPStatus(hipMemcpy(d_b_quant_, h_qweights.data(),
                              h_qweights.size() * sizeof(unsigned),
                              hipMemcpyHostToDevice));
+    CheckHIPStatus(hipMemcpy(d_global_scale_, &kGlobalScale, sizeof(float),
+                             hipMemcpyHostToDevice));
 
     return absl::OkStatus();
 }
@@ -188,8 +193,12 @@ void PetitMatmulFp4Base::FreeQuantizedMemory() {
     if (d_scales_) {
         CheckHIPStatus(hipFree(d_scales_));
     }
+    if (d_global_scale_) {
+        CheckHIPStatus(hipFree(d_global_scale_));
+    }
     d_b_quant_ = nullptr;
     d_scales_ = nullptr;
+    d_global_scale_ = nullptr;
 }
 
 class PetitMatmulFactory : public MatmulFactory {

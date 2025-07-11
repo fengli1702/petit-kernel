@@ -16,9 +16,9 @@ class Dispatcher {
     }
 
     int Dispatch(unsigned *c, const unsigned *a, const unsigned *b,
-                 const unsigned *scales, float global_scale, const unsigned m,
-                 const unsigned n, const unsigned k, unsigned long solution_id,
-                 hipStream_t stream) {
+                 const unsigned *scales, const float *global_scale,
+                 const unsigned m, const unsigned n, const unsigned k,
+                 unsigned long solution_id, hipStream_t stream) {
         const auto it = solution_id_to_call_.find(solution_id);
         if (it == solution_id_to_call_.end()) {
             return kErrorKernelShape;
@@ -32,7 +32,7 @@ class Dispatcher {
 };
 
 int GemmFp4Fp16Grid(unsigned *c, const unsigned *a, const unsigned *b,
-                    const unsigned *scales, float global_scale,
+                    const unsigned *scales, const float *global_scale,
                     const unsigned m, const unsigned n, const unsigned k,
                     const PetitSolutionHints &hints, unsigned long solution_id,
                     hipStream_t stream) {
