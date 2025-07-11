@@ -134,9 +134,21 @@ template <class Config> struct ShmBuf {
     using Data = std::conditional_t<Config::kUseZeroPoints && Config::kZpInShm,
                                     DataWithZP, DataWithoutZP>;
 
+    static constexpr unsigned kMaxResultMTilePerPartition = std::min<unsigned>(
+        Config::kWarpTileM,
+        kMaxShmSize /
+            (kGroupN * sizeof(half) * Config::kTile / Config::WP::kPartitionM));
+
+    // Try to balance the reduction to save overheads of calculating the
+    // addresses.
+    static constexpr unsigned kResultMTilePerPartition =
+        Config::kWarpTileM /
+        tal::CeilingDiv(Config::kWarpTileM, kMaxResultMTilePerPartition);
+
     using Layout = union {
         Data data[Config::kStages];
-        uint2 result[Config::kGroupM * Config::kGroupN / 4];
+        uint2 result[kResultMTilePerPartition * Config::WP::kPartitionM *
+                     Config::kTile * Config::kGroupN / 4];
         ReductionStorage red;
     };
 };
