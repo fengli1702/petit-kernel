@@ -68,15 +68,37 @@ unsigned long ChooseDefaultFp4Fp16Solution(unsigned m, unsigned n, unsigned k,
     };
 
     auto is_better = [&](const SolutionId &a, const SolutionId &b) {
-        if (a.tile_k != b.tile_k) {
-            return a.tile_k > b.tile_k;
-        } else if (a.pipeline != b.pipeline) {
+        const unsigned tile_m_a = a.tile_m * kTile;
+        const unsigned tile_m_b = b.tile_m * kTile;
+        bool is_small_m = m <= 64;
+
+        if (a.pipeline != b.pipeline) {
             return a.pipeline > b.pipeline;
-        } else {
-            unsigned m_a = m / (a.tile_m * kTile), m_b = n / (b.tile_m * kTile);
-            return m_b > m_a;
         }
-        return a.Repr() < b.Repr();
+
+        if (is_small_m) {
+            if (a.tile_m != b.tile_m) {
+                unsigned delta_a = std::abs(static_cast<int>(m % tile_m_a) -
+                                            static_cast<int>(tile_m_a / 2));
+                unsigned delta_b = std::abs(static_cast<int>(m % tile_m_b) -
+                                            static_cast<int>(tile_m_b / 2));
+                return delta_a < delta_b;
+            } else if (a.warp_partition_k != b.warp_partition_k) {
+                return a.warp_partition_k > b.warp_partition_k;
+            } else if (a.tile_n != b.tile_n) {
+                return a.tile_n < b.tile_n;
+            }
+        }
+
+        if (a.tile_m + a.tile_n != b.tile_m + b.tile_n) {
+            return a.tile_m + a.tile_n > b.tile_m + b.tile_n;
+        } else if (a.tile_m != b.tile_m) {
+            return a.tile_m > b.tile_m;
+        } else if (a.tile_k != b.tile_k) {
+            return a.tile_k > b.tile_k;
+        }
+
+        return a.Repr() > b.Repr();
     };
 
     std::optional<SolutionId> best_sol;
