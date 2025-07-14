@@ -102,10 +102,10 @@ torch::Tensor ProcessNvFp4Scales(torch::Tensor &scales, int64_t size_n,
     return out;
 }
 
-torch::Tensor MulFp4A16(const torch::Tensor &A, const torch::Tensor &B,
-                        const torch::Tensor &s,
-                        const torch::Tensor &global_scale, int64_t size_m,
-                        int64_t size_n, int64_t size_k, int64_t solution_id) {
+torch::Tensor MulNvFp4A16(const torch::Tensor &A, const torch::Tensor &B,
+                          const torch::Tensor &s,
+                          const torch::Tensor &global_scale, int64_t size_m,
+                          int64_t size_n, int64_t size_k, int64_t solution_id) {
     int groupsize = size_k / s.size(1);
     if (groupsize != 16) {
         AT_ERROR("Only groupsize = 16 is supported. size_k = ", size_k,
@@ -158,8 +158,8 @@ torch::Tensor MulFp4A16(const torch::Tensor &A, const torch::Tensor &B,
     return c;
 }
 
-py::list GetFp4Solutions(const PetitSolutionHints &hints, int64_t size_m,
-                         int64_t size_n, int64_t size_k) {
+py::list GetNvFp4Solutions(const PetitSolutionHints &hints, int64_t size_m,
+                           int64_t size_n, int64_t size_k) {
     unsigned n_solutions = 0;
     int err =
         GemmGetSolutions(hints, size_m, size_n, size_k, nullptr, &n_solutions);

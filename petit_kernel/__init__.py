@@ -23,7 +23,7 @@ def process_nvfp4_scales(
     return ops.process_nvfp4_scales(scales, size_n, size_k)
 
 
-def mul_fp4_a16(
+def mul_nvfp4_a16(
     a: torch.Tensor,
     b: torch.Tensor,
     s: torch.Tensor,
@@ -33,7 +33,7 @@ def mul_fp4_a16(
     size_k: int,
     solution_id: int,
 ) -> torch.Tensor:
-    return ops.mul_fp4_a16(a, b, s, global_scale, size_m, size_n, size_k, solution_id)
+    return ops.mul_nvfp4_a16(a, b, s, global_scale, size_m, size_n, size_k, solution_id)
 
 
 def get_fp4_solutions(

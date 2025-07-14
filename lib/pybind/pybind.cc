@@ -8,8 +8,9 @@ using namespace causalflow::petit::rocm::quantization;
 PYBIND11_MODULE(ops, m) {
     m.def("repack_nvfp4", &RepackNvFp4, "Repack NVFP4 to Petit FP4");
     m.def("process_nvfp4_scales", &ProcessNvFp4Scales, "Process NVFP4 scales");
-    m.def("mul_fp4_a16", &MulFp4A16, "Multiply FP4 FP16");
-    m.def("get_fp4_solutions", &GetFp4Solutions, "Get possible fp4 solutions");
+    m.def("mul_nvfp4_a16", &MulNvFp4A16, "Multiply NVFP4 FP16");
+    m.def("get_nvfp4_solutions", &GetNvFp4Solutions,
+          "Get possible nvfp4 solutions");
 
     pybind11::class_<PetitSolutionHints>(m, "PetitSolutionHints")
         .def(pybind11::init<>())
