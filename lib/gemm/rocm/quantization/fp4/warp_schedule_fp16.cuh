@@ -12,6 +12,8 @@ template <class ElementA, bool kHighPrecision> struct MmaSelector;
 template <bool kHighPrecision> struct MmaSelector<__half, kHighPrecision> {
     using DQ = Dequantizer<half2, kDataTypeFp4e2m1>;
     using DS = DequantizerForFp8Scale<half2, !kHighPrecision>;
+    using UDQ = UnifiedDequantizerForFp4Fp16<kHighPrecision>;
+
     __device__ static inline float4 Mma(uint2 fa, uint2 fb, float4 c) {
         return mma_m16n16k16_fp16(fa, fb, c);
     }
@@ -21,6 +23,8 @@ template <bool kHighPrecision>
 struct MmaSelector<__hip_bfloat16, kHighPrecision> {
     using DQ = Dequantizer<__hip_bfloat162, kDataTypeFp4e2m1>;
     using DS = DequantizerForFp8Scale<__hip_bfloat162, !kHighPrecision>;
+    using UDQ = UnifiedDequantizerForFp4Bf16<kHighPrecision>;
+
     __device__ static inline float4 Mma(uint2 fa, uint2 fb, float4 c) {
         return mma_m16n16k16_bf16(fa, fb, c);
     }
@@ -132,18 +136,12 @@ template <class Config> struct WarpPartitionMatmul {
         using causalflow::tal::make_coord;
         using ArchMma =
             MmaSelector<typename Config::ElementA, Config::kHighPrecision>;
-        using DQ = ArchMma::DQ;
-        using DS = ArchMma::DS;
-        using VectorType = DQ::VectorType;
+        using UDQ = ArchMma::UDQ;
         typename Config::WarpAccumLayout accum_layout;
         typename Config::WarpMatmulRegALayout reg_a_layout;
 
-        VectorType ds;
-        DS::DequantFullScale(&ds, b.packed_scales);
+        auto ds = UDQ::DequantScales(b.packed_scales);
         const uint *qw = reinterpret_cast<const uint *>(&b.qw);
-
-        const auto bias = DQ::Bias(Config::kHighPrecision);
-        const VectorType bias2{bias, bias};
 
         // Compute C^T = B^T * A so that the actual accumulation results
         // are in row-major.
@@ -151,20 +149,9 @@ template <class Config> struct WarpPartitionMatmul {
             auto acc_idx = accum_layout(make_coord(warp_idx_n, j));
             auto va_idx = reg_a_layout(make_coord(j));
             uint q = qw[j];
-            VectorType dq[4];
-            DQ::Dequant(dq, q);
-            DQ::Dequant(dq + 2, q << 8);
+            typename UDQ::UnpackedData dq;
+            UDQ::DequantWithScale(dq, q, j < 2 ? ds.x : ds.y);
 
-            VectorType scale;
-            scale.x = j < 2 ? ds.x : ds.y;
-            scale.y = scale.x;
-
-            for (int i = 0; i < 4; i++) {
-                if constexpr (Config::kHighPrecision) {
-                    dq[i] = fastmath::hmul2(dq[i], bias2);
-                }
-                dq[i] = fastmath::hmul2(dq[i], scale);
-            }
             static_assert(sizeof(dq) == sizeof(uint4), "");
             const uint2 *frag_b = reinterpret_cast<const uint2 *>(&dq[0]);
 

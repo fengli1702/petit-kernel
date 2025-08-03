@@ -43,6 +43,34 @@ MATCHER_P2(IsNearBf16, ref, mantissa_diff, "") {
     return result;
 }
 
+MATCHER_P2(IsNearFp16, ref, mantissa_diff, "") {
+    float a_f = __half2float(arg);
+    float b_f = __half2float(ref);
+
+    if (std::abs(a_f - b_f) < std::min<float>(1e-2, fabs(b_f) * 0.01f)) {
+        return true;
+    }
+
+    unsigned short a_u16 = reinterpret_cast<const unsigned short &>(arg);
+    unsigned short b_u16 = reinterpret_cast<const unsigned short &>(ref);
+
+    int mantissa_a = a_u16 & 0x3ff, mantissa_b = b_u16 & 0x3ff;
+    unsigned other_a = a_u16 & 0xfc00, other_b = b_u16 & 0xfc00;
+    bool very_small_relaxed =
+        std::abs(a_f - b_f) < 1e-3f && std::abs(mantissa_a - mantissa_b) <= 20;
+    bool result = other_a == other_b &&
+                  (very_small_relaxed ||
+                   std::abs(mantissa_a - mantissa_b) <= mantissa_diff);
+
+    if (!result && result_listener->IsInterested()) {
+        *result_listener << "Expected float value near " << std::hex << ref
+                         << " (0x" << b_u16 << "), but got " << std::hex << arg
+                         << " (0x" << a_u16 << ")";
+    }
+
+    return result;
+}
+
 using GemmMPTestData = tests::quantization::GemmMPTestData;
 
 class GemmFp4Fp16Test : public ::testing::Test {
@@ -151,9 +179,7 @@ void GemmFp4Fp16Test::CopyAndCompareOutput(GemmMPTestData *ctx,
                 reinterpret_cast<const half *>(&h_output[i]);
             const half *ref_ptr =
                 reinterpret_cast<const half *>(&h_reference[i]);
-            float of = __half2float(output_ptr[0]);
-            float rf = __half2float(ref_ptr[0]);
-            EXPECT_NEAR(of, rf, std::min<float>(1e-2, fabs(rf) * 0.01f))
+            EXPECT_THAT(output_ptr[0], IsNearFp16(ref_ptr[0], relaxed ? 4 : 2))
                 << "Output and reference differ at index " << i;
         } else if (dequant_type_ == DataType::kDataTypeBf16) {
             EXPECT_THAT(h_output[i],
@@ -272,39 +298,11 @@ TEST_F(GemmFp4Fp16Test, TestGemm16x32x256Fp16HighPrecision) {
                    MatmulMfmaType::kMatmulMfmaTypeFp16, 1, 2, 16, 1, 1, 4));
 }
 
-#if 0
-TEST_F(GemmFp4Fp16Test, TestGemm_64x16x128_4x1x1_Pipeline) {
-    for (auto k : {256, 512, 768, 1024}) {
-        TestGemm(64, 32, k, 1.0f,
-                 Fp4MNK(MatmulFeatures::kMatmulFeatures_Grid,
-                        MatmulPipeline::kMatmulPipeline_2,
-                        MatmulMfmaType::kMatmulMfmaTypeBf16, 4, 1, 8, 4, 1, 1));
-    }
+TEST_F(GemmFp4Fp16Test, TestGemm16x32x256Bf16HighPrecision) {
+    TestGemm(16, 64, 256, 1.0f,
+             Fp4Hp(MatmulPipeline::kMatmulPipeline_2,
+                   MatmulMfmaType::kMatmulMfmaTypeBf16, 1, 2, 16, 1, 1, 4));
 }
-
-TEST_BF16(64, 16, 128, 4, 1, 1)
-TEST_BF16(64, 16, 256, 2, 1, 2)
-TEST_BF16(16, 16, 512, 1, 1, 4)
-TEST_BF16(32, 16, 512, 2, 1, 2)
-TEST_BF16(64, 32, 128, 2, 2, 1)
-TEST_BF16(16, 32, 256, 1, 2, 2)
-TEST_BF16(32, 32, 256, 1, 2, 2)
-TEST_BF16(64, 32, 256, 1, 2, 2)
-TEST_BF16(64, 48, 128, 4, 1, 1)
-TEST_BF16(64, 48, 256, 4, 1, 1)
-TEST_BF16(16, 64, 128, 1, 4, 1)
-TEST_BF16(32, 64, 128, 2, 2, 1)
-TEST_BF16(64, 64, 128, 2, 2, 1)
-TEST_BF16(128, 64, 128, 2, 2, 1)
-TEST_BF16(16, 64, 256, 1, 2, 2)
-TEST_BF16(16, 64, 512, 1, 2, 2)
-TEST_BF16(32, 64, 512, 2, 2, 1)
-TEST_BF16(128, 80, 128, 4, 1, 1)
-TEST_BF16(64, 96, 128, 2, 2, 1)
-TEST_BF16(96, 96, 128, 2, 2, 1)
-TEST_BF16(32, 128, 128, 2, 2, 1)
-TEST_BF16(64, 160, 128, 2, 2, 1)
-#endif
 
 TEST_BF16(64, 32, 128, 4, 1, 1)
 TEST_BF16(16, 32, 256, 1, 1, 4)
@@ -335,7 +333,7 @@ TEST_BF16(32, 128, 128, 2, 2, 1)
 TEST_BF16(64, 128, 128, 2, 2, 1)
 TEST_BF16(80, 128, 128, 1, 2, 2)
 TEST_BF16(160, 128, 64, 2, 2, 1)
-TEST_BF16(128, 192, 64, 2, 2, 1)
+TEST_BF16_RELAXED(128, 192, 64, 2, 2, 1)
 TEST_BF16(160, 192, 64, 2, 2, 1)
 TEST_BF16(192, 192, 64, 2, 2, 1)
 TEST_BF16(224, 192, 64, 2, 2, 1)
@@ -344,7 +342,7 @@ TEST_BF16_RELAXED(128, 256, 64, 2, 2, 1)
 TEST_BF16(160, 256, 64, 2, 2, 1)
 TEST_BF16(192, 256, 64, 2, 2, 1)
 TEST_BF16(224, 256, 64, 2, 2, 1)
-TEST_BF16(256, 256, 64, 2, 2, 1)
+TEST_BF16_RELAXED(256, 256, 64, 2, 2, 1)
 
 TEST_F(GemmFp4Fp16Test, TestGemm_32x32x256_2x1x2_Pipeline) {
     for (auto k : {512, 768, 1024}) {

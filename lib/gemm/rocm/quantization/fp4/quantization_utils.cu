@@ -124,11 +124,22 @@ using RepackScaleLayout128x16 = RepackScaleLayout<128, 16, 2, 1, 2, 1>;
 using RepackQWeightLayout64x32 = RepackQWeightLayout<64, 32, 2, 2, 4, 1>;
 using RepackScaleLayout64x32 = RepackScaleLayout<64, 32, 1, 2, 4, 1>;
 
-__device__ static unsigned DequantShift(unsigned v) {
+__device__ static unsigned PetitFormat(unsigned v) {
     unsigned r = 0;
     for (int i = 0; i < 8; i++) {
-        unsigned shift = (3 - (i / 2)) + (i % 2) * 4;
-        r |= ((v >> (i * 4)) & 0xf) << (shift * 4);
+        unsigned off_s = 15 - (i % 4 / 2) * 8 + (i % 2) * 16;
+        unsigned off_d = off_s - 6;
+        if (i >= 4) {
+            off_s = 31 - off_s;
+            off_d = off_s + 4;
+        }
+        unsigned u = (v >> (i * 4)) & 0xf;
+        unsigned sgn = u >> 3;
+        unsigned val = u & 0x7;
+        if (i >= 4) {
+            val = __builtin_bitreverse32(val) >> 29;
+        }
+        r |= (sgn << off_s) | (val << off_d);
     }
     return r;
 }
@@ -247,21 +258,21 @@ __global__ void RepackNvFp4ScalesKernel(uint4 *__restrict__ out_scales,
     out_s2[output_coord] = ret;
 }
 
-template <class QWLayout, class Dequantizer, class DequantizerForScale>
+template <class QWLayout, class UDQ>
 __global__ void DequantizePetitFp4Kernel(uint4 *__restrict__ output,
                                          const uint4 *__restrict__ input,
                                          const uint4 *__restrict__ scales,
                                          float global_scale, unsigned size_k,
                                          unsigned size_n) {
     using namespace causalflow::tal;
-    using Element = typename Dequantizer::Element;
-    using VectorType = typename Dequantizer::VectorType;
+    using DQ = typename UDQ::DQ;
+    using Element = typename DQ::Element;
+    using VectorType = typename DQ::VectorType;
     static constexpr unsigned kLayoutM = QWLayout::kLayoutM;
     static constexpr unsigned kLayoutN = QWLayout::kLayoutN;
     static constexpr unsigned kGroupM = QWLayout::kGroupM;
     static constexpr unsigned kGroupN = QWLayout::kGroupN;
     static constexpr unsigned kScaleVecSize = sizeof(uchar2) / sizeof(char);
-    static constexpr bool kHighPrecision = !DequantizerForScale::kUpscale;
 
     const unsigned tid = threadIdx.x, id_k = blockIdx.x, id_n = blockIdx.y;
     const unsigned wid = tid / kWarpSize, wtid = tid % kWarpSize;
@@ -286,11 +297,7 @@ __global__ void DequantizePetitFp4Kernel(uint4 *__restrict__ output,
     unsigned short packed_scale = reinterpret_cast<const unsigned short *>(
         scales)[layout_scale(make_coord(id_k, id_n, wid, wtid))];
 
-    const auto bias = Dequantizer::Bias(kHighPrecision);
-    const VectorType bias2{bias, bias};
-
-    VectorType ds;
-    DequantizerForScale::DequantFullScale(&ds, packed_scale);
+    auto ds = UDQ::DequantScales(packed_scale);
     const auto global_scale_f16 = Element(global_scale);
     VectorType gs2{global_scale_f16, global_scale_f16};
 
@@ -298,16 +305,10 @@ __global__ void DequantizePetitFp4Kernel(uint4 *__restrict__ output,
 
     for (int i = 0; i < 4; i++) {
         const uint q = reinterpret_cast<const uint *>(&qw)[i];
-        const Element s = i < 2 ? ds.x : ds.y;
-        VectorType s2{s, s};
-        VectorType dq[4];
-        Dequantizer::Dequant(dq, q);
-        Dequantizer::Dequant(dq + 2, q << 8);
+        const auto s = i < 2 ? ds.x : ds.y;
+        typename UDQ::UnpackedData dq;
+        UDQ::DequantWithScale(dq, q, s);
         for (int j = 0; j < 4; j++) {
-            if constexpr (kHighPrecision) {
-                dq[j] = __hmul2(dq[j], bias2);
-            }
-            dq[j] = __hmul2(dq[j], s2);
             ret[i * 4 + j] = __hmul2(dq[j], gs2);
         }
     }
@@ -319,11 +320,13 @@ __global__ void DequantizePetitFp4Kernel(uint4 *__restrict__ output,
     }
 }
 
-template <class Dequantizer, class DequantizerForScale>
+template <class UDQ>
 __global__ void DequantizeNvFp4Kernel(uint4 *output, const uint4 *input,
                                       const uchar2 *scales, float global_scale,
                                       unsigned size_k, unsigned size_n) {
     using namespace causalflow::tal;
+    using Dequantizer = typename UDQ::DQ;
+    // using DequantizerForScale = typename UDQ::DS;
     using Element = typename Dequantizer::Element;
     using VectorType = typename Dequantizer::VectorType;
     static constexpr unsigned kGroupK = 128;
@@ -360,35 +363,27 @@ __global__ void DequantizeNvFp4Kernel(uint4 *output, const uint4 *input,
     const auto bias = Dequantizer::Bias(false);
     const VectorType bias2{bias, bias};
 
-    // The channel scale is fp8e4m3 without offset
-    static const unsigned short kScaleBiasU16 =
-        (2 * (1 << (Dequantizer::kFp16Ex - 1)) - 8 - 1)
-        << (16 - Dequantizer::kFp16Ex - 1);
-    const Element scale_bias = reinterpret_cast<const Element &>(kScaleBiasU16);
-    const VectorType scale_bias2{scale_bias, scale_bias};
+    // The scale is in the E4M3 format, we need to convert it to the E5M3 format
+    // and times 2**7 to reuse the dequantizer.
+    half2 ds;
+    ds.x = __hip_cvt_fp8_to_halfraw(packed_scale & 0xff, __HIP_E4M3);
+    ds.y = __hip_cvt_fp8_to_halfraw((packed_scale >> 8), __HIP_E4M3);
+    ds = __hmul2(ds, half2{1 << kFp8ScaleBias, 1 << kFp8ScaleBias});
 
-    VectorType ds;
-    DequantizerForScale::Dequant(&ds, packed_scale);
-    ds = __hmul2(ds, scale_bias2);
     VectorType ret[16];
 
     const auto global_scale_f16 = Element(global_scale);
     VectorType gs2{global_scale_f16, global_scale_f16};
 
+    typename UDQ::UnpackedData dq;
     for (int i = 0; i < 4; i++) {
         const uint q = reinterpret_cast<const uint *>(&qw)[i];
-        unsigned q_shifted = DequantShift(q);
-        VectorType dq[4];
-        Dequantizer::Dequant(dq, q_shifted);
-        Dequantizer::Dequant(dq + 2, q_shifted << 8);
-        const Element s = i < 2 ? ds.x : ds.y;
-        VectorType s2{s, s};
+        unsigned q_shifted = PetitFormat(q);
+        const auto s = i < 2 ? ds.x : ds.y;
+        UDQ::DequantWithScale(dq, q_shifted, s);
+
         for (int j = 0; j < 4; j++) {
-            dq[j] = __hmul2(dq[j], bias2);
-        }
-        for (int j = 0; j < 4; j++) {
-            ret[i * 4 + j] = __hmul2(dq[j], s2);
-            ret[i * 4 + j] = __hmul2(ret[i * 4 + j], gs2);
+            ret[i * 4 + j] = __hmul2(dq[j], gs2);
         }
     }
 
@@ -407,16 +402,14 @@ int DequantNvFp4(unsigned *output, const unsigned *input,
     // We do not need to update the global scale as the kernel compute the bias
     // directly
     if (out_type == kDataTypeFp16) {
-        using DQ = Dequantizer<half2, kDataTypeFp4e2m1>;
-        using DS = DequantizerForFp8Scale<half2, false>;
-        DequantizeNvFp4Kernel<DQ, DS><<<grid, block>>>(
+        using UDQ = UnifiedDequantizerForFp4Fp16<true>;
+        DequantizeNvFp4Kernel<UDQ><<<grid, block>>>(
             reinterpret_cast<uint4 *>(output),
             reinterpret_cast<const uint4 *>(input),
             reinterpret_cast<const uchar2 *>(scales), global_scale, k, n);
     } else if (out_type == kDataTypeBf16) {
-        using DQ = Dequantizer<__hip_bfloat162, kDataTypeFp4e2m1>;
-        using DS = DequantizerForFp8Scale<__hip_bfloat162, false>;
-        DequantizeNvFp4Kernel<DQ, DS><<<grid, block>>>(
+        using UDQ = UnifiedDequantizerForFp4Bf16<true>;
+        DequantizeNvFp4Kernel<UDQ><<<grid, block>>>(
             reinterpret_cast<uint4 *>(output),
             reinterpret_cast<const uint4 *>(input),
             reinterpret_cast<const uchar2 *>(scales), global_scale, k, n);
@@ -438,18 +431,16 @@ int DequantPetitFp4(unsigned *output, const unsigned *input,
     }
 
     if (out_type == kDataTypeFp16) {
-        using DQ = Dequantizer<half2, kDataTypeFp4e2m1>;
-        using DS = DequantizerForFp8Scale<half2, true>;
-        global_scale *= DS::GlobalScaleFactor();
-        DequantizePetitFp4Kernel<Layout, DQ, DS><<<grid, block>>>(
+        using UDQ = UnifiedDequantizerForFp4Fp16<true>;
+        global_scale *= UDQ::DS::GlobalScaleFactor();
+        DequantizePetitFp4Kernel<Layout, UDQ><<<grid, block>>>(
             reinterpret_cast<uint4 *>(output),
             reinterpret_cast<const uint4 *>(input),
             reinterpret_cast<const uint4 *>(scales), global_scale, k, n);
     } else if (out_type == kDataTypeBf16) {
-        using DQ = Dequantizer<__hip_bfloat162, kDataTypeFp4e2m1>;
-        using DS = DequantizerForFp8Scale<__hip_bfloat162, true>;
-        global_scale *= DS::GlobalScaleFactor();
-        DequantizePetitFp4Kernel<Layout, DQ, DS><<<grid, block>>>(
+        using UDQ = UnifiedDequantizerForFp4Bf16<true>;
+        global_scale *= UDQ::DS::GlobalScaleFactor();
+        DequantizePetitFp4Kernel<Layout, UDQ><<<grid, block>>>(
             reinterpret_cast<uint4 *>(output),
             reinterpret_cast<const uint4 *>(input),
             reinterpret_cast<const uint4 *>(scales), global_scale, k, n);
@@ -468,7 +459,7 @@ void RepackNvFp4ToPetitFp4Weights(unsigned *output, const unsigned *input,
     dim3 block(Layout::kNumWarps * kWarpSize);
 
     struct ProcessWeightOp {
-        __device__ uint operator()(uint qv) const { return DequantShift(qv); }
+        __device__ uint operator()(uint qv) const { return PetitFormat(qv); }
     };
     ProcessWeightOp op;
 

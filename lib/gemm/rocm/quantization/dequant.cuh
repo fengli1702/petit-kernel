@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gemm/rocm/amd_fastmath.cuh"
 #include "gemm/rocm/amd_intrinsics.cuh"
 #include "gemm/rocm/quantization/types.h"
 
@@ -86,6 +87,20 @@ struct DequantizerForFp8ScaleImpl {
     }
 };
 
+__device__ static inline void Fp4ToFp16(unsigned o[4], unsigned q) {
+    unsigned qr = __builtin_bitreverse32(q);
+    o[0] = q & 0x8e008e00;
+    o[1] = (q << 8) & 0x8e008e00;
+    o[2] = qr & 0x8e008e00;
+    o[3] = (qr << 8) & 0x8e008e00;
+}
+
+__device__ static inline void Fp4ToBf8(unsigned o[2], unsigned q) {
+    unsigned qr = __builtin_bitreverse32(q);
+    o[0] = q & 0x8e8e8e8e;
+    o[1] = qr & 0x8e8e8e8e;
+}
+
 } // namespace detail
 
 template <>
@@ -151,5 +166,143 @@ struct DequantizerForFp8Scale<__hip_bfloat162, kUpscale_>
         reinterpret_cast<unsigned *>(out)[0] = v;
     }
 };
+
+template <bool kHighPrecision> struct UnifiedDequantizerForFp4Fp16 {
+    using UnpackedScale = half2;
+    using Element = half;
+    using UnpackedData = half2[4];
+
+    using DQ = Dequantizer<half2, kDataTypeFp4e2m1>;
+    using DS = DequantizerForFp8Scale<half2, !kHighPrecision>;
+
+    __device__ static UnpackedScale DequantScales(unsigned short s) {
+        UnpackedScale ds;
+        DS::DequantFullScale(&ds, s);
+        return ds;
+    }
+
+    __device__ static void DequantWithScale(UnpackedData &out, unsigned q,
+                                            Element scale) {
+        half2 s2{scale, scale};
+        const auto bias = DQ::Bias(kHighPrecision);
+        const half2 bias2{bias, bias};
+        detail::Fp4ToFp16(reinterpret_cast<unsigned *>(&out), q);
+
+        for (int i = 0; i < 4; i++) {
+            if constexpr (kHighPrecision) {
+                out[i] = fastmath::hmul2(out[i], bias2);
+            }
+            out[i] = fastmath::hmul2(out[i], s2);
+        }
+    }
+};
+
+template <bool kHighPrecision> struct UnifiedDequantizerForFp4Bf16 {
+    using UnpackedScale = __hip_bfloat162;
+    using Element = __hip_bfloat16;
+    using UnpackedData = __hip_bfloat162[4];
+
+    using DQ = Dequantizer<__hip_bfloat162, kDataTypeFp4e2m1>;
+    using DS = DequantizerForFp8Scale<__hip_bfloat162, !kHighPrecision>;
+
+    __device__ static half2 DequantScales(unsigned short s) {
+        using FP8Scale = DequantizerForFp8Scale<half2, false>;
+        half2 ds;
+        FP8Scale::Dequant(&ds, s);
+        return ds;
+    }
+
+    __device__ static void DequantWithScale(UnpackedData &out, unsigned q,
+                                            half scale) {
+#if defined(__gfx942__) || defined(__gfx950__)
+        DequantWithScaleImplBf8(out, q, scale);
+#else
+        DequantWithScaleImplFp16(out, q, scale);
+#endif
+    }
+
+  private:
+    __device__ static void DequantWithScaleImplFp16(UnpackedData &out,
+                                                    unsigned q, half scale);
+    __device__ static void DequantWithScaleImplBf8(UnpackedData &out,
+                                                   unsigned q, half scale);
+};
+
+template <bool kHighPrecision>
+__device__ void
+UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplFp16(
+    UnpackedData &out, unsigned q, half scale) {
+
+    const float2 s2{__half2float(scale), __half2float(scale)};
+
+    // Since internallly it is FP16, the bias is the same as the FP16 bias
+    // For high precision we divide by 2 ** 7 to undo the preprocessing of
+    // the scales
+    static constexpr unsigned kBias = kHighPrecision ? 0x43000000  // 2** 7
+                                                     : 0x46800000; // 2 ** 14
+    const float2 bias_f32_2{reinterpret_cast<const float &>(kBias),
+                            reinterpret_cast<const float &>(kBias)};
+
+    detail::Fp4ToFp16(reinterpret_cast<unsigned *>(&out), q);
+    const half2 *h2 = reinterpret_cast<const half2 *>(&out);
+    float2 out_f2[4];
+    for (int i = 0; i < 4; i++) {
+        out_f2[i].x = __half2float(h2[i].x);
+        out_f2[i].y = __half2float(h2[i].y);
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if constexpr (kHighPrecision) {
+            out_f2[i] = amdgcn_pk_mul_f32(out_f2[i], bias_f32_2);
+        }
+        out_f2[i] = amdgcn_pk_mul_f32(out_f2[i], s2);
+    }
+
+    unsigned *o = reinterpret_cast<unsigned *>(&out);
+    for (int i = 0; i < 4; i++) {
+        const uint2 *f2 = reinterpret_cast<const uint2 *>(&out_f2[i]);
+        o[i] = amdgcn_perm_b32(f2[0].y, f2[0].x, 0x07060302);
+    }
+}
+
+template <bool kHighPrecision>
+__device__ void
+UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplBf8(
+    UnpackedData &out, unsigned q, half scale) {
+#if defined(__gfx942__) || defined(__gfx950__)
+    const float2 s2{__half2float(scale), __half2float(scale)};
+
+    // Since internallly it is FP16, the bias is the same as the FP16 bias
+    // For high precision we divide by 2 ** 7 to undo the preprocessing of
+    // the scales
+    static constexpr unsigned kBias = kHighPrecision ? 0x43000000  // 2** 7
+                                                     : 0x46800000; // 2 ** 14
+    const float2 bias_f32_2{reinterpret_cast<const float &>(kBias),
+                            reinterpret_cast<const float &>(kBias)};
+
+    unsigned bf8[2];
+    detail::Fp4ToBf8(bf8, q);
+
+    float2 out_f2[4];
+    auto *out_v2f = reinterpret_cast<v2f *>(&out);
+    for (int i = 0; i < 2; i++) {
+        out_v2f[i * 2] = __builtin_amdgcn_cvt_pk_f32_bf8(bf8[i], false);
+        out_v2f[i * 2 + 1] = __builtin_amdgcn_cvt_pk_f32_bf8(bf8[i], true);
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if constexpr (kHighPrecision) {
+            out_f2[i] = amdgcn_pk_mul_f32(out_f2[i], bias_f32_2);
+        }
+        out_f2[i] = amdgcn_pk_mul_f32(out_f2[i], s2);
+    }
+
+    unsigned *o = reinterpret_cast<unsigned *>(&out);
+    o[0] = amdgcn_perm_b32(out_f2[1].y, out_f2[0].y, 0x07060302);
+    o[1] = amdgcn_perm_b32(out_f2[1].x, out_f2[0].x, 0x07060302);
+    o[2] = amdgcn_perm_b32(out_f2[3].x, out_f2[2].x, 0x07060302);
+    o[3] = amdgcn_perm_b32(out_f2[3].y, out_f2[2].y, 0x07060302);
+#endif
+}
 
 } // namespace causalflow::petit::rocm::quantization
