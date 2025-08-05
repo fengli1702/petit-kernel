@@ -8,4 +8,4 @@ CMAKE_ARGS="-DCMAKE_PREFIX_PATH=/opt/rocm;${TORCH_PATH} -DCMAKE_HIP_ARCHITECTURE
 export CMAKE_ARGS
 python3 setup.py clean --all
 python3 setup.py bdist_wheel --dist-dir=dist
-python3 -m auditwheel repair dist/petit_kernel-*-cp312-cp312-linux_x86_64.whl --exclude '*' -w dist/
+python3 -m auditwheel repair dist/petit_kernel-*-cp*-cp*-linux_x86_64.whl --exclude '*' -w dist/
