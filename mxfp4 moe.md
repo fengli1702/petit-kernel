@@ -5,7 +5,9 @@
 8.23
 
 add [unit test](./lib/gemm/rocm/quantization/fp4/gemm_moe_fp4_fp16_rocm_test.cc) 
+
 add [basic moe phase2 ](./lib/gemm/rocm/quantization/fp4/gemm_moe_fp4_fp16_grid.cc)
+
 add [mxfp4](./lib/gemm/rocm/quantization/mxfp4_dequant.cuh) 
 
 ![unit test](./pic/unit%20test%208.23.png)
