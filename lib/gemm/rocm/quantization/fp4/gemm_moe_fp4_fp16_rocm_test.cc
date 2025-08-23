@@ -28,10 +28,10 @@ static inline void CheckHipblasStatus(hipblasStatus_t status) {
     }
 }
 
-// ============= 精度匹配器 =============
+// ============= 改进的精度匹配器 =============
 
 MATCHER_P2(IsNearFp16, ref, abs_tolerance, "") {
-    // arg 和 ref 都是 __half 类型
+    // 假设 arg 和 ref 都是 __half 类型
     const float a_f = __half2float(arg);
     const float b_f = __half2float(ref);
     const float abs_diff = std::abs(a_f - b_f);
@@ -72,6 +72,8 @@ MATCHER_P2(IsNearFp16, ref, abs_tolerance, "") {
             return true;
         }
     }
+    
+    // 如果不匹配，并且监听器感兴趣，则打印详细信息
     if (result_listener->IsInterested()) {
         *result_listener << "Expected fp16 value near " << b_f << " (0x" << std::hex << ref_bits
                          << "), but got " << a_f << " (0x" << std::hex << arg_bits << ")";
@@ -81,7 +83,7 @@ MATCHER_P2(IsNearFp16, ref, abs_tolerance, "") {
 }
 
 MATCHER_P2(IsNearBf16, ref, abs_tolerance, "") {
-    // arg 和 ref 都是 hip_bfloat16 或类似类型
+    // 假设 arg 和 ref 都是 hip_bfloat16 或类似类型
     const uint32_t a_u32 = static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&arg)) << 16;
     const uint32_t b_u32 = static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&ref)) << 16;
     const float a_f = *reinterpret_cast<const float*>(&a_u32);
@@ -141,8 +143,8 @@ inline hip_bfloat16 float_to_bfloat16(float f) {
 class OfficialMxFp4Quantizer {
 public:
     static constexpr float e2m1_values[16] = {
-        0.0f, 0.0625f, 0.125f, 0.25f, 0.5f, 1.0f, 2.0f, 4.0f,
-        -0.0f, -0.0625f, -0.125f, -0.25f, -0.5f, -1.0f, -2.0f, -4.0f
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,        // 正值 (0-7)
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f  // 负值 (8-15)
     };
     
     static float CalculateOptimalScale(const std::vector<float>& block_values) {
@@ -155,9 +157,11 @@ public:
             return 1.0f;
         }
         
-        // 让最大值映射到2.0-3.0范围，保留一些余量
-        float target_max = 2.5f;
-        int exp_val = std::ceil(std::log2f(max_abs / target_max));
+        // 计算所需的最小缩放因子
+        float min_scale = max_abs / 6.0f;
+        
+        // 找到大于等于min_scale的最小的2的幂次
+        int exp_val = std::max(0, (int)std::ceil(std::log2f(min_scale)));
         return std::pow(2.0f, exp_val);
     }
     
@@ -710,36 +714,35 @@ protected:
         std::cout << "\n======================================" << std::endl;
         std::cout << "Testing E2M1 Exact Value Representation" << std::endl;
         std::cout << "======================================" << std::endl;
- 
-        // E2M1可精确表示的值
+
         std::vector<float> exact_values = {
-            0.0f, 0.0625f, 0.125f, 0.25f, 0.5f, 1.0f, 2.0f, 4.0f,
-            -0.0625f, -0.125f, -0.25f, -0.5f, -1.0f, -2.0f, -4.0f
+            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,        // 正值
+            -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f        // 负值 (跳过-0.0f因为与0.0f相同)
         };
- 
+
         std::cout << "\nVerifying exact E2M1 values can be perfectly quantized:" << std::endl;
-        
+
         for (float test_val : exact_values) {
             // 创建一个全是该值的块
             std::vector<float> block(32, test_val);
             float scale = OfficialMxFp4Quantizer::CalculateOptimalScale(block);
-            
+
             unsigned char idx = OfficialMxFp4Quantizer::QuantizeToE2M1Index(test_val, scale);
             float dequant = OfficialMxFp4Quantizer::Dequantize(idx, scale);
-            
+
             float error = std::abs(test_val - dequant);
             std::cout << "  Value " << std::setw(8) << test_val 
                       << " -> scale=" << std::setw(8) << scale
                       << " -> idx=" << std::setw(2) << (int)idx
                       << " -> dequant=" << std::setw(8) << dequant
                       << " (error=" << error << ")";
-            
+
             if (error < 1e-6f) {
                 std::cout << " ✓" << std::endl;
             } else {
                 std::cout << " ✗ ERROR!" << std::endl;
             }
-            
+
             EXPECT_NEAR(test_val, dequant, 1e-6f) 
                 << "E2M1 exact value should be perfectly representable";
         }

@@ -10,6 +10,8 @@ add [basic moe phase2 ](./lib/gemm/rocm/quantization/fp4/gemm_moe_fp4_fp16_grid.
 
 add [mxfp4](./lib/gemm/rocm/quantization/mxfp4_dequant.cuh) 
 
+The quantitative method uses the same approach as [gpt-oss](https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/weights.py). 
+
 ![unit test](./pic/unit%20test%208.23.png)
 
 ```bash

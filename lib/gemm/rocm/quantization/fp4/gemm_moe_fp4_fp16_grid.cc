@@ -82,7 +82,8 @@ __global__ void MoeMxFp4Kernel(
     }
 }
 
-// MxFP4 MOE kernel shared memory
+// 优化的MxFP4 MOE kernel（使用shared memory）
+
 template <typename ElementType>
 __global__ void MoeMxFp4OptimizedKernel(
     ElementType* __restrict__ output,
@@ -95,6 +96,7 @@ __global__ void MoeMxFp4OptimizedKernel(
     const unsigned hidden_size,
     const unsigned intermediate_size
 ) {
+    // 修复shared memory布局，确保对齐
     extern __shared__ char shared_mem[];
     unsigned* shared_expert_id = reinterpret_cast<unsigned*>(shared_mem);
     ElementType* shared_input = reinterpret_cast<ElementType*>(shared_mem + sizeof(unsigned));
@@ -102,25 +104,29 @@ __global__ void MoeMxFp4OptimizedKernel(
     const unsigned token_id = blockIdx.x;
     const unsigned out_dim = threadIdx.x + blockIdx.y * blockDim.x;
     
-    // --- Step 1: 加载expert_id ---
+    // --- Step 1: 安全加载expert_id ---
+    // 确保所有block都能正确加载expert_id，即使token_id超出范围
     if (threadIdx.x == 0) {
         if (token_id < total_tokens) {
             shared_expert_id[0] = expert_indices[token_id];
         } else {
-            shared_expert_id[0] = 0; 
+            shared_expert_id[0] = 0; // 默认值，虽然后续会early return
         }
     }
     __syncthreads();
     
+    // 现在所有线程都可以安全读取expert_id
     const unsigned expert_id = shared_expert_id[0];
     
-    // --- Step 2: 边界检查---
+    // --- Step 2: 边界检查和early return ---
+    // 注意：必须在所有线程都参与完同步后再做边界检查
     bool valid_thread = (token_id < total_tokens && out_dim < intermediate_size);
     
     // --- Step 3: 协作加载输入向量到共享内存 ---
     const ElementType* token_input = (token_id < total_tokens) ? 
         (input + token_id * hidden_size) : nullptr;
     
+    // 所有线程参与加载，即使是无效线程也要参与以保持同步
     for (unsigned i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         if (token_input != nullptr) {
             shared_input[i] = token_input[i];
@@ -215,6 +221,7 @@ int MoeMxFp4SecondStage(
     
     if (hints.a_type == DataType::kDataTypeFp16) {
         if (use_optimized) {
+            // 修复：使用具体的类型 half 而不是 ElementType
             size_t shared_mem_size = sizeof(unsigned) + hidden_size * sizeof(half);
             // 确保8字节对齐
             shared_mem_size = ((shared_mem_size + 7) / 8) * 8;
@@ -245,6 +252,7 @@ int MoeMxFp4SecondStage(
         }
     } else if (hints.a_type == DataType::kDataTypeBf16) {
         if (use_optimized) {
+            // 修复：使用具体的类型 __hip_bfloat16 而不是 ElementType
             size_t shared_mem_size = sizeof(unsigned) + hidden_size * sizeof(__hip_bfloat16);
             // 确保8字节对齐
             shared_mem_size = ((shared_mem_size + 7) / 8) * 8;
