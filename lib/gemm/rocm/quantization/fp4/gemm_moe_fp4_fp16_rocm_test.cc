@@ -28,10 +28,10 @@ static inline void CheckHipblasStatus(hipblasStatus_t status) {
     }
 }
 
-// ============= 改进的精度匹配器 =============
+// ============= 精度匹配器 =============
 
 MATCHER_P2(IsNearFp16, ref, abs_tolerance, "") {
-    // 假设 arg 和 ref 都是 __half 类型
+    // arg 和 ref 都是 __half 类型
     const float a_f = __half2float(arg);
     const float b_f = __half2float(ref);
     const float abs_diff = std::abs(a_f - b_f);
@@ -83,7 +83,7 @@ MATCHER_P2(IsNearFp16, ref, abs_tolerance, "") {
 }
 
 MATCHER_P2(IsNearBf16, ref, abs_tolerance, "") {
-    // 假设 arg 和 ref 都是 hip_bfloat16 或类似类型
+    // arg 和 ref 都是 hip_bfloat16 或类似类型
     const uint32_t a_u32 = static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&arg)) << 16;
     const uint32_t b_u32 = static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&ref)) << 16;
     const float a_f = *reinterpret_cast<const float*>(&a_u32);
@@ -125,18 +125,7 @@ MATCHER_P2(IsNearBf16, ref, abs_tolerance, "") {
 
     return false;
 }
-// 如果bfloat16转换函数不可用，提供辅助函数
-inline float bfloat16_to_float(hip_bfloat16 bf) {
-    uint16_t bits = *reinterpret_cast<uint16_t*>(&bf);
-    uint32_t float_bits = static_cast<uint32_t>(bits) << 16;
-    return *reinterpret_cast<float*>(&float_bits);
-}
 
-inline hip_bfloat16 float_to_bfloat16(float f) {
-    uint32_t float_bits = *reinterpret_cast<uint32_t*>(&f);
-    uint16_t bf16_bits = static_cast<uint16_t>(float_bits >> 16);
-    return *reinterpret_cast<hip_bfloat16*>(&bf16_bits);
-}
 
 // ============= MxFP4量化器 =============
 
@@ -675,9 +664,9 @@ protected:
                     << "GPU result should be very close to consistency reference at index " << i;
             }
             if (::testing::Test::HasFailure()) {
-                std::cout << "\n❌ TEST FAILED! (Backend Consistency Check)" << std::endl;
+                std::cout << "\n TEST FAILED! (Backend Consistency Check)" << std::endl;
             } else {
-                std::cout << "\n✅ TEST PASSED! (Backend Consistency Check)" << std::endl;
+                std::cout << "\n TEST PASSED! (Backend Consistency Check)" << std::endl;
             }
         } else {
             // 模式1: 期望GPU结果在“量化误差”的可接受范围内
@@ -702,9 +691,9 @@ protected:
             }
 
             if (::testing::Test::HasFailure()) {
-                 std::cout << "\n❌ TEST FAILED! (Quantization Error Check)" << std::endl;
+                 std::cout << "\n TEST FAILED! (Quantization Error Check)" << std::endl;
             } else {
-                 std::cout << "\n✅ TEST PASSED! (Quantization Error Check)" << std::endl;
+                 std::cout << "\n TEST PASSED! (Quantization Error Check)" << std::endl;
             }
         }
     }
@@ -738,9 +727,9 @@ protected:
                       << " (error=" << error << ")";
 
             if (error < 1e-6f) {
-                std::cout << " ✓" << std::endl;
+                std::cout << " OK!" << std::endl;
             } else {
-                std::cout << " ✗ ERROR!" << std::endl;
+                std::cout << " ERROR!" << std::endl;
             }
 
             EXPECT_NEAR(test_val, dequant, 1e-6f) 
