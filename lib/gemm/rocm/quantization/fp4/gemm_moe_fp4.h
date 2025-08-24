@@ -34,4 +34,23 @@ int MoeMxFp4SecondStage(
     hipStream_t stream = nullptr
 );
 
+int CallTestGPUDequantKernel(
+    float* gpu_results,                   // 输出：GPU反量化结果
+    const unsigned* fp4_values,          // 输入：4-bit值数组
+    const float* scales,                  // 输入：scale数组
+    unsigned num_tests,                   // 测试数量
+    hipStream_t stream                    // 显式stream参数
+);
+
+// 完整反量化kernel的Host接口函数 
+int CallFullDequantMxFp4Kernel(
+    void* dequant_weights,                // 输出：反量化权重
+    const void* quant_weights,            // 输入：量化权重
+    const void* scales,                   // 输入：缩放因子
+    unsigned hidden_size,
+    unsigned intermediate_size,
+    DataType element_type,                // 元素类型
+    hipStream_t stream                    // 显式stream参数
+);
+
 } // namespace causalflow::petit::rocm::quantization::fp4

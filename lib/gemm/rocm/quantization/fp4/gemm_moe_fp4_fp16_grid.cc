@@ -6,7 +6,7 @@
 
 namespace causalflow::petit::rocm::quantization::fp4 {
 
-// 基础的MxFP4 MOE kernel
+// 基础的MxFP4 MOE kernel - 使用官方E2M1格式
 template <typename ElementType>
 __global__ void MoeMxFp4Kernel(
     ElementType* __restrict__ output,              // [total_tokens, intermediate_size]
@@ -96,7 +96,7 @@ __global__ void MoeMxFp4OptimizedKernel(
     const unsigned hidden_size,
     const unsigned intermediate_size
 ) {
-    
+    // shared memory布局，确保对齐
     extern __shared__ char shared_mem[];
     unsigned* shared_expert_id = reinterpret_cast<unsigned*>(shared_mem);
     ElementType* shared_input = reinterpret_cast<ElementType*>(shared_mem + sizeof(unsigned));
@@ -104,8 +104,8 @@ __global__ void MoeMxFp4OptimizedKernel(
     const unsigned token_id = blockIdx.x;
     const unsigned out_dim = threadIdx.x + blockIdx.y * blockDim.x;
     
-    // --- Step 1: 加载expert_id ---
-   
+    // --- Step 1: 安全加载expert_id ---
+    // 确保所有block都能正确加载expert_id，即使token_id超出范围
     if (threadIdx.x == 0) {
         if (token_id < total_tokens) {
             shared_expert_id[0] = expert_indices[token_id];
@@ -115,27 +115,29 @@ __global__ void MoeMxFp4OptimizedKernel(
     }
     __syncthreads();
     
- 
+    // 现在所有线程都可以安全读取expert_id
     const unsigned expert_id = shared_expert_id[0];
     
     // --- Step 2: 边界检查和early return ---
+    // 注意：必须在所有线程都参与完同步后再做边界检查
     bool valid_thread = (token_id < total_tokens && out_dim < intermediate_size);
     
-    // --- Step 3: 加载输入data到共享内存 ---
+    // --- Step 3: 协作加载输入向量到共享内存 ---
     const ElementType* token_input = (token_id < total_tokens) ? 
         (input + token_id * hidden_size) : nullptr;
     
+    // 所有线程参与加载，即使是无效线程也要参与以保持同步
     for (unsigned i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         if (token_input != nullptr) {
             shared_input[i] = token_input[i];
         } else {
-           
+            // 无效线程加载零值，虽然结果不会被使用
             shared_input[i] = ElementType(0);
         }
     }
     __syncthreads();
     
-    // --- Step 4:计算 ---
+    // --- Step 4: 只有有效线程进行计算 ---
     if (!valid_thread) return;
     
     // 计算权重和scale偏移
@@ -157,7 +159,7 @@ __global__ void MoeMxFp4OptimizedKernel(
             input_val = __bfloat162float(shared_input[h]);
         }
         
-        // 权重解包逻辑
+        // 权重解包逻辑保持不变
         unsigned packed_idx = out_dim * packed_cols_stride + (h / 8);
         unsigned bit_offset = (h % 8) * 4;
         
@@ -182,8 +184,9 @@ __global__ void MoeMxFp4OptimizedKernel(
         token_output[out_dim] = __float2bfloat16(accumulator);
     }
 }
-
 // Host接口实现
+
+// Host接口实现 - 修复版本
 int MoeMxFp4SecondStage(
     unsigned *experts_output,
     const unsigned *gating_output,
@@ -218,7 +221,7 @@ int MoeMxFp4SecondStage(
     
     if (hints.a_type == DataType::kDataTypeFp16) {
         if (use_optimized) {
-  
+           
             size_t shared_mem_size = sizeof(unsigned) + hidden_size * sizeof(half);
             // 确保8字节对齐
             shared_mem_size = ((shared_mem_size + 7) / 8) * 8;
@@ -290,4 +293,195 @@ int MoeMxFp4SecondStage(
     
     return 0;  // 成功
     }
+
+
+// ============= GPU测试kernels：专门测试SimpleMxFp4DequantE2M1 =============
+
+template <typename ElementType>
+__global__ void TestGPUDequantKernel(
+    float* __restrict__ gpu_results,              // 输出：GPU反量化结果
+    const unsigned* __restrict__ fp4_values,     // 输入：4-bit值数组
+    const float* __restrict__ scales,            // 输入：scale数组
+    unsigned num_tests                            // 测试数量
+) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_tests) return;
+    
+    unsigned fp4_val = fp4_values[idx];
+    float scale = scales[idx];
+    
+    // 调用我们要测试的GPU函数
+    gpu_results[idx] = SimpleMxFp4DequantE2M1<ElementType>(fp4_val, scale);
+}
+
+// 完整的反量化kernel (用于实际的权重矩阵反量化)
+template <typename ElementType>
+__global__ void FullDequantMxFp4Kernel(
+    ElementType* __restrict__ dequant_weights,    // 输出：[hidden_size, intermediate_size]
+    const unsigned* __restrict__ quant_weights,   // 输入：量化权重
+    const float* __restrict__ scales,             // 输入：缩放因子
+    const unsigned hidden_size,
+    const unsigned intermediate_size
+) {
+    const unsigned h = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned out_dim = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (h >= hidden_size || out_dim >= intermediate_size) return;
+    
+    // 解包量化权重
+    const unsigned packed_cols_stride = hidden_size / 8;
+    unsigned packed_idx = out_dim * packed_cols_stride + (h / 8);
+    unsigned bit_offset = (h % 8) * 4;
+    
+    unsigned packed_weight = quant_weights[packed_idx];
+    unsigned fp4_val = (packed_weight >> bit_offset) & 0xF;
+    
+    // 计算scale索引
+    unsigned h_block = h / kMxFp4BlockSize;
+    unsigned scale_idx = h_block * intermediate_size + out_dim;
+    float scale = scales[scale_idx];
+    
+    // 使用我们要测试的反量化函数
+    float weight_val = SimpleMxFp4DequantE2M1<ElementType>(fp4_val, scale);
+    
+    // 写入结果 (行主序：h * intermediate_size + out_dim)
+    // 修复类型转换问题
+    dequant_weights[h * intermediate_size + out_dim] = static_cast<ElementType>(weight_val);
+}
+
+// 特化版本以避免类型转换歧义
+template<>
+__global__ void FullDequantMxFp4Kernel<half>(
+    half* __restrict__ dequant_weights,
+    const unsigned* __restrict__ quant_weights,
+    const float* __restrict__ scales,
+    const unsigned hidden_size,
+    const unsigned intermediate_size
+) {
+    const unsigned h = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned out_dim = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (h >= hidden_size || out_dim >= intermediate_size) return;
+    
+    // 解包量化权重
+    const unsigned packed_cols_stride = hidden_size / 8;
+    unsigned packed_idx = out_dim * packed_cols_stride + (h / 8);
+    unsigned bit_offset = (h % 8) * 4;
+    
+    unsigned packed_weight = quant_weights[packed_idx];
+    unsigned fp4_val = (packed_weight >> bit_offset) & 0xF;
+    
+    // 计算scale索引
+    unsigned h_block = h / kMxFp4BlockSize;
+    unsigned scale_idx = h_block * intermediate_size + out_dim;
+    float scale = scales[scale_idx];
+    
+    // 使用我们要测试的反量化函数
+    float weight_val = SimpleMxFp4DequantE2M1<half>(fp4_val, scale);
+    
+    // 写入结果
+    dequant_weights[h * intermediate_size + out_dim] = __float2half(weight_val);
+}
+
+template<>
+__global__ void FullDequantMxFp4Kernel<__hip_bfloat16>(
+    __hip_bfloat16* __restrict__ dequant_weights,
+    const unsigned* __restrict__ quant_weights,
+    const float* __restrict__ scales,
+    const unsigned hidden_size,
+    const unsigned intermediate_size
+) {
+    const unsigned h = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned out_dim = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (h >= hidden_size || out_dim >= intermediate_size) return;
+    
+    // 解包量化权重
+    const unsigned packed_cols_stride = hidden_size / 8;
+    unsigned packed_idx = out_dim * packed_cols_stride + (h / 8);
+    unsigned bit_offset = (h % 8) * 4;
+    
+    unsigned packed_weight = quant_weights[packed_idx];
+    unsigned fp4_val = (packed_weight >> bit_offset) & 0xF;
+    
+    // 计算scale索引
+    unsigned h_block = h / kMxFp4BlockSize;
+    unsigned scale_idx = h_block * intermediate_size + out_dim;
+    float scale = scales[scale_idx];
+    
+    // 使用我们要测试的反量化函数
+    float weight_val = SimpleMxFp4DequantE2M1<__hip_bfloat16>(fp4_val, scale);
+    
+    // 写入结果
+    dequant_weights[h * intermediate_size + out_dim] = __float2bfloat16(weight_val);
+}
+
+// Host接口函数：调用TestGPUDequantKernel (移除默认参数)
+int CallTestGPUDequantKernel(
+    float* gpu_results,
+    const unsigned* fp4_values,
+    const float* scales,
+    unsigned num_tests,
+    hipStream_t stream
+) {
+    dim3 blockDim(256);
+    dim3 gridDim((num_tests + blockDim.x - 1) / blockDim.x);
+    
+    TestGPUDequantKernel<half><<<gridDim, blockDim, 0, stream>>>(
+        gpu_results, fp4_values, scales, num_tests);
+    
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        return -1;  // kernel启动失败
+    }
+    
+    return 0;  // 成功
+}
+
+// Host接口函数：调用FullDequantMxFp4Kernel (移除默认参数)
+int CallFullDequantMxFp4Kernel(
+    void* dequant_weights,
+    const void* quant_weights,
+    const void* scales,
+    unsigned hidden_size,
+    unsigned intermediate_size,
+    DataType element_type,
+    hipStream_t stream
+) {
+    if (hidden_size % kMxFp4BlockSize != 0) {
+        return -1;  // hidden_size必须是32的倍数
+    }
+    
+    dim3 blockDim(16, 16);
+    dim3 gridDim(
+        (hidden_size + blockDim.x - 1) / blockDim.x,
+        (intermediate_size + blockDim.y - 1) / blockDim.y
+    );
+    
+    if (element_type == DataType::kDataTypeFp16) {
+        FullDequantMxFp4Kernel<half><<<gridDim, blockDim, 0, stream>>>(
+            reinterpret_cast<half*>(dequant_weights),
+            reinterpret_cast<const unsigned*>(quant_weights),
+            reinterpret_cast<const float*>(scales),
+            hidden_size, intermediate_size
+        );
+    } else if (element_type == DataType::kDataTypeBf16) {
+        FullDequantMxFp4Kernel<__hip_bfloat16><<<gridDim, blockDim, 0, stream>>>(
+            reinterpret_cast<__hip_bfloat16*>(dequant_weights),
+            reinterpret_cast<const unsigned*>(quant_weights),
+            reinterpret_cast<const float*>(scales),
+            hidden_size, intermediate_size
+        );
+    } else {
+        return -2;  // 不支持的数据类型
+    }
+    
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        return -3;  // kernel启动失败
+    }
+    
+    return 0;  // 成功
+}
+
 }
