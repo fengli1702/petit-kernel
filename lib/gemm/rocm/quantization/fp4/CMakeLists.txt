@@ -12,15 +12,6 @@ add_test(gemm_fp4_fp16_rocm_test gemm_fp4_fp16_rocm_test)
 add_executable(gemm_fp4_fp16_gen_solution_list gen_solution_list.cc)
 target_link_libraries(gemm_fp4_fp16_gen_solution_list hip::host gflags fmt::fmt)
 
-add_executable(gemm_moe_fp4_fp16_rocm_test gemm_moe_fp4_fp16_rocm_test.cc)
-target_link_libraries(gemm_moe_fp4_fp16_rocm_test 
-    causalflow-petit-rocm-quantization 
-    causalflow-petit-tests 
-    roc::hipblaslt 
-    GTest::gmock 
-    GTest::gtest_main
-)
-add_test(gemm_moe_fp4_fp16_rocm_test gemm_moe_fp4_fp16_rocm_test)
 
 # 代码生成设置
 set (CODEGEN_EXECUTABLE $<TARGET_FILE:gemm_fp4_fp16_gen_solution_list>)
@@ -49,7 +40,6 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 set(GPU_KERNEL_SRCS
   quantization_utils.cu
   gemm_fp4_fp16_grid.cc
-  gemm_moe_fp4_fp16_grid.cc
 )
 
 set_source_files_properties(${GPU_KERNEL_SRCS} PROPERTIES
