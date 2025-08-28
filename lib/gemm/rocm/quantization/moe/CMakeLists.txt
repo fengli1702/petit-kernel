@@ -3,6 +3,8 @@
 # MoE模块的GPU kernel源文件
 set(MOE_GPU_KERNEL_SRCS
     moe_gemm_fp4_grid.cc
+    moe_benchmark.cc      # 添加benchmark实现
+    moe_test_utils.cc     # 添加共用工具函数
 )
 
 # 设置GPU kernel源文件属性
@@ -32,6 +34,7 @@ target_link_libraries(causalflow-petit-rocm-moe-quantization
 set_source_files_properties(moe_gemm_fp4_test.cc PROPERTIES
     LANGUAGE HIP
 )
+
 # 添加测试可执行文件
 add_executable(moe_fp4_fp16_rocm_test moe_gemm_fp4_test.cc)
 target_link_libraries(moe_fp4_fp16_rocm_test 

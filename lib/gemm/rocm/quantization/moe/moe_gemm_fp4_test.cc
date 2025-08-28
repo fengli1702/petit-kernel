@@ -3,6 +3,7 @@
 #include "tests/quantization.h"
 #include "utils/hip_helper.h"
 #include "hal/device.h"
+#include "moe_test_utils.h"
 
 #include <climits>
 #include <cmath>
@@ -19,20 +20,11 @@
 namespace causalflow::petit::rocm::quantization::moe {
 
 // ============================================================================
-// BF16转换辅助函数 - 专家级解决方案
+// BF16转换辅助函数 - 使用工具函数
 // ============================================================================
 namespace {
-    // BF16到float转换（通过位操作）
-    inline float Bfloat16ToFloat(unsigned short bf16_val) {
-        unsigned f32_val = static_cast<unsigned>(bf16_val) << 16;
-        return reinterpret_cast<const float&>(f32_val);
-    }
-    
-    // float到BF16转换（通过位操作，简单截断）
-    inline unsigned short FloatToBfloat16(float f_val) {
-        unsigned f32_bits = reinterpret_cast<const unsigned&>(f_val);
-        return static_cast<unsigned short>(f32_bits >> 16);
-    }
+    using bf16_utils::Bfloat16ToFloat;
+    using bf16_utils::FloatToBfloat16;
 }
 
 // ============================================================================
@@ -81,54 +73,8 @@ MATCHER_P2(IsNearBf16, ref, mantissa_diff, "") {
 }
 
 // ============================================================================
-// CPU参考实现
+// CPU参考实现 - 移除重复定义，使用工具类
 // ============================================================================
-
-class CPUMxFp4Reference {
-public:
-    static constexpr float cpu_e2m1_lut[16] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,        // 正值 (0-7)
-        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f  // 负值 (8-15)
-    };
-    
-    static float CalculateOptimalScale(const std::vector<float>& block_values) {
-        float max_abs = 0.0f;
-        for (float val : block_values) {
-            max_abs = std::max(max_abs, std::abs(val));
-        }
-        
-        if (max_abs < 1e-9f) return 1.0f;
-        
-        float min_scale = max_abs / 6.0f;
-        int exp_val = std::max(0, (int)std::ceil(std::log2f(min_scale)));
-        return std::pow(2.0f, exp_val);
-    }
-    
-    static unsigned char QuantizeToE2M1Index(float value, float scale) {
-        if (scale == 0.0f) scale = 1.0f;
-        float scaled_value = value / scale;
-        
-        int best_idx = 0;
-        float min_error = std::abs(scaled_value - cpu_e2m1_lut[0]);
-        
-        for (int i = 1; i < 16; i++) {
-            float error = std::abs(scaled_value - cpu_e2m1_lut[i]);
-            if (error < min_error) {
-                min_error = error;
-                best_idx = i;
-            }
-        }
-        
-        return static_cast<unsigned char>(best_idx);
-    }
-    
-    static float CPUDequantE2M1(unsigned fp4_val, float scale) {
-        fp4_val = fp4_val & 0xF;
-        return cpu_e2m1_lut[fp4_val] * scale;
-    }
-};
-
-constexpr float CPUMxFp4Reference::cpu_e2m1_lut[16];
 
 // CPU参考激活函数实现
 class CPUActivationReference {
@@ -160,23 +106,6 @@ public:
     }
 };
 
-// ============================================================================
-// 量化权重结构 - 支持W1和W2
-// ============================================================================
-
-struct QuantizedFFNWeights {
-    // W1权重和scales
-    std::vector<unsigned> w1_data;
-    std::vector<float> w1_scales;
-    
-    // W2权重和scales  
-    std::vector<unsigned> w2_data;
-    std::vector<float> w2_scales;
-    
-    // 元数据
-    MxFp4WeightMetadata w1_metadata;
-    MxFp4WeightMetadata w2_metadata;
-};
 
 // ============================================================================
 // 主测试类
@@ -273,7 +202,7 @@ protected:
         CheckHIPStatus(hipMemcpy(gpu_results.data(), d_gpu_results, 
                                 num_tests * sizeof(float), hipMemcpyDeviceToHost));
         
-        // CPU参考计算
+        // CPU参考计算 - 使用工具类
         std::vector<float> cpu_results(num_tests);
         for (unsigned i = 0; i < num_tests; i++) {
             cpu_results[i] = CPUMxFp4Reference::CPUDequantE2M1(
@@ -362,11 +291,11 @@ protected:
             original_weights[i] = __float2half(val);
         }
         
-        // 执行量化
+        // 执行量化 - 使用工具函数
         auto quantized = QuantizeWeights(original_weights, hidden_size, intermediate_size);
         
-        // 使用GPU反量化kernel
-        auto gpu_dequantized = GPUDequantizeWeights(
+        // 使用GPU反量化kernel - 使用工具函数
+        auto gpu_dequantized = gpu_dequant::GPUDequantizeWeightsFP16(
             quantized.w1_data, 
             quantized.w1_scales, 
             hidden_size, 
@@ -480,7 +409,7 @@ protected:
         }
         
         auto quantized = QuantizeWeightsBF16(original_weights, hidden_size, intermediate_size);
-        auto gpu_dequantized = GPUDequantizeWeightsBF16(quantized.w1_data, quantized.w1_scales, hidden_size, intermediate_size);
+        auto gpu_dequantized = gpu_dequant::GPUDequantizeWeightsBF16(quantized.w1_data, quantized.w1_scales, hidden_size, intermediate_size);
         AnalyzeRoundTripAccuracyBF16(original_weights, gpu_dequantized);
         
         std::cout << "✓ Quantization Round-Trip Accuracy Test (BF16) PASSED" << std::endl;
@@ -522,6 +451,7 @@ protected:
         
         return result;
     }
+
     QuantizedFFNWeights QuantizeWeightsBF16(
         const std::vector<unsigned short>& original_weights,
         unsigned input_dim, unsigned output_dim
@@ -827,8 +757,8 @@ protected:
         //TestQuantizationRoundTripAccuracy();
         //TestActivationFunctionCorrectness();
 
-        // Step 4: 准备测试数据
-        auto [input_data, ffn_weights, expert_indices] = PrepareFFNTestDataFP16(config, use_random_data);
+        // Step 4: 准备测试数据 - 使用工具函数
+        auto [input_data, ffn_weights, expert_indices] = fp16_data::PrepareFFNTestData(config, use_random_data);
 
         // Step 5: 计算CPU参考结果
         //std::cout << "\n--- Computing CPU Reference ---" << std::endl;
@@ -856,37 +786,11 @@ protected:
                   << "x" << config.intermediate_size << ", activation=" << static_cast<int>(config.activation) << std::endl;
         std::cout << "======================================" << std::endl;
 
-        // BF16数据准备 - 使用unsigned short表示BF16
-        std::vector<unsigned short> input_data(config.total_tokens * config.hidden_size);
-        std::vector<unsigned short> w1_original(config.hidden_size * config.intermediate_size);
-        std::vector<unsigned short> w2_original(config.intermediate_size * config.hidden_size);
-        std::vector<unsigned> expert_indices(config.total_tokens, 0); // 单专家测试
+        // 数据准备 - 使用工具函数
+        auto [input_data, ffn_weights, expert_indices] = bf16_data::PrepareFFNTestData(config, use_random_data);
 
-        std::mt19937 gen(42);
-        if (use_random_data) {
-            std::normal_distribution<float> input_dist(0.0f, 0.3f);
-            std::normal_distribution<float> weight_dist(0.0f, 0.2f);
-
-            for (auto& val : input_data) val = FloatToBfloat16(input_dist(gen));
-            for (auto& val : w1_original) val = FloatToBfloat16(weight_dist(gen));
-            for (auto& val : w2_original) val = FloatToBfloat16(weight_dist(gen));
-        } else {
-            // 使用与FP16非随机测试类似的大数值
-            for (size_t i = 0; i < input_data.size(); i++) {
-                input_data[i] = FloatToBfloat16(1.0f + 0.5f * (i % 10));
-            }
-            for (size_t i = 0; i < w1_original.size(); i++) {
-                w1_original[i] = FloatToBfloat16(0.5f + 0.2f * (i % 20));
-            }
-            for (size_t i = 0; i < w2_original.size(); i++) {
-                w2_original[i] = FloatToBfloat16(0.3f + 0.1f * (i % 15));
-            }
-        }
-
-        // 量化权重
-        QuantizedFFNWeights ffn_weights = QuantizeFFNWeightsBF16(w1_original, w2_original, config);
-
-        // CPU参考计算
+        // Step 5: 计算CPU参考结果
+        //std::cout << "\n--- Computing CPU Reference ---" << std::endl;
         auto reference_result = ComputeHipBLASLtCompleteFFNBF16(
             input_data, ffn_weights, expert_indices, config, global_scale
         );
@@ -903,41 +807,12 @@ protected:
     }
 
     // ============================================================================
-    // 测试数据准备 - FP16版本
+    // 测试数据准备 - 使用工具函数
     // ============================================================================
     
     std::tuple<std::vector<half>, QuantizedFFNWeights, std::vector<unsigned>> 
     PrepareFFNTestDataFP16(const MoEStage2Config& config, bool use_random_data) {
-        std::vector<half> input_data(config.total_tokens * config.hidden_size);
-        std::vector<half> w1_original(config.hidden_size * config.intermediate_size);
-        std::vector<half> w2_original(config.intermediate_size * config.hidden_size);
-        std::vector<unsigned> expert_indices(config.total_tokens, 0); // 单专家测试
-        
-        std::mt19937 gen(42);
-        if (use_random_data) {
-            std::normal_distribution<float> input_dist(0.0f, 0.3f);
-            std::normal_distribution<float> weight_dist(0.0f, 0.2f);
-            
-            for (auto& val : input_data) val = __float2half(input_dist(gen));
-            for (auto& val : w1_original) val = __float2half(weight_dist(gen));
-            for (auto& val : w2_original) val = __float2half(weight_dist(gen));
-        } else {
-            // 使用更大的固定值，确保量化后不为零
-            for (size_t i = 0; i < input_data.size(); i++) {
-                input_data[i] = __float2half(1.0f + 0.5f * (i % 10));  // 1.0~5.5
-            }
-            for (size_t i = 0; i < w1_original.size(); i++) {
-                w1_original[i] = __float2half(0.5f + 0.2f * (i % 20)); // 0.5~4.3
-            }
-            for (size_t i = 0; i < w2_original.size(); i++) {
-                w2_original[i] = __float2half(0.3f + 0.1f * (i % 15)); // 0.3~1.7
-            }
-        }
-        
-        // 量化W1和W2权重
-        QuantizedFFNWeights ffn_weights = QuantizeFFNWeightsFP16(w1_original, w2_original, config);
-        
-        return std::make_tuple(input_data, ffn_weights, expert_indices);
+        return fp16_data::PrepareFFNTestData(config, use_random_data);
     }
 
     QuantizedFFNWeights QuantizeFFNWeightsFP16(
@@ -945,27 +820,7 @@ protected:
         const std::vector<half>& w2_weights, 
         const MoEStage2Config& config
     ) {
-        QuantizedFFNWeights result;
-        
-        // 量化W1 (hidden_size -> intermediate_size)
-        result.w1_data.resize((config.hidden_size * config.intermediate_size + 7) / 8, 0);
-        result.w1_scales.resize((config.hidden_size / kMxFp4BlockSize) * config.intermediate_size);
-        QuantizeWeightsLayerFP16(w1_weights, result.w1_data, result.w1_scales, 
-                           config.hidden_size, config.intermediate_size);
-        
-        // 量化W2 (intermediate_size -> hidden_size)
-        result.w2_data.resize((config.intermediate_size * config.hidden_size + 7) / 8, 0);
-        result.w2_scales.resize((config.intermediate_size / kMxFp4BlockSize) * config.hidden_size);
-        QuantizeWeightsLayerFP16(w2_weights, result.w2_data, result.w2_scales,
-                           config.intermediate_size, config.hidden_size);
-        
-        // 设置元数据
-        result.w1_metadata = MxFp4WeightMetadata::CalculateMetadata(
-            config.hidden_size, config.intermediate_size, config.input_type);
-        result.w2_metadata = MxFp4WeightMetadata::CalculateMetadata(
-            config.intermediate_size, config.hidden_size, config.input_type);
-        
-        return result;
+        return fp16_data::QuantizeFFNWeights(w1_weights, w2_weights, config);
     }
 
     QuantizedFFNWeights QuantizeFFNWeightsBF16(
@@ -973,27 +828,7 @@ protected:
         const std::vector<unsigned short>& w2_weights, 
         const MoEStage2Config& config
     ) {
-        QuantizedFFNWeights result;
-        
-        // 量化W1 (hidden_size -> intermediate_size)
-        result.w1_data.resize((config.hidden_size * config.intermediate_size + 7) / 8, 0);
-        result.w1_scales.resize((config.hidden_size / kMxFp4BlockSize) * config.intermediate_size);
-        QuantizeWeightsLayerBF16(w1_weights, result.w1_data, result.w1_scales, 
-                           config.hidden_size, config.intermediate_size);
-        
-        // 量化W2 (intermediate_size -> hidden_size)
-        result.w2_data.resize((config.intermediate_size * config.hidden_size + 7) / 8, 0);
-        result.w2_scales.resize((config.intermediate_size / kMxFp4BlockSize) * config.hidden_size);
-        QuantizeWeightsLayerBF16(w2_weights, result.w2_data, result.w2_scales,
-                           config.intermediate_size, config.hidden_size);
-        
-        // 设置元数据
-        result.w1_metadata = MxFp4WeightMetadata::CalculateMetadata(
-            config.hidden_size, config.intermediate_size, config.input_type);
-        result.w2_metadata = MxFp4WeightMetadata::CalculateMetadata(
-            config.intermediate_size, config.hidden_size, config.input_type);
-        
-        return result;
+        return bf16_data::QuantizeFFNWeights(w1_weights, w2_weights, config);
     }
 
     void QuantizeWeightsLayerFP16(
@@ -1002,31 +837,7 @@ protected:
         std::vector<float>& scales,
         unsigned input_dim, unsigned output_dim
     ) {
-        for (unsigned out_dim = 0; out_dim < output_dim; ++out_dim) {
-            const unsigned packed_cols_stride = input_dim / 8;
-
-            for (unsigned in_block = 0; in_block < input_dim / kMxFp4BlockSize; ++in_block) {
-                std::vector<float> block_vals(kMxFp4BlockSize);
-                for (unsigned i = 0; i < kMxFp4BlockSize; ++i) {
-                    unsigned in_idx = in_block * kMxFp4BlockSize + i;
-                    unsigned weight_idx = in_idx * output_dim + out_dim;
-                    block_vals[i] = __half2float(original_weights[weight_idx]);
-                }
-
-                float scale = CPUMxFp4Reference::CalculateOptimalScale(block_vals);
-                unsigned scale_idx = in_block * output_dim + out_dim;
-                scales[scale_idx] = scale;
-
-                for (unsigned i = 0; i < kMxFp4BlockSize; ++i) {
-                    unsigned in_idx = in_block * kMxFp4BlockSize + i;
-                    float weight_val = block_vals[i];
-                    unsigned char fp4_idx = CPUMxFp4Reference::QuantizeToE2M1Index(weight_val, scale);
-                    unsigned packed_idx = out_dim * packed_cols_stride + (in_idx / 8);
-                    unsigned bit_offset = (in_idx % 8) * 4;
-                    quantized_data[packed_idx] |= (static_cast<unsigned>(fp4_idx & 0xF) << bit_offset);
-                }
-            }
-        }
+        fp16_data::QuantizeWeightsLayer(original_weights, quantized_data, scales, input_dim, output_dim);
     }
 
     void QuantizeWeightsLayerBF16(
@@ -1035,32 +846,7 @@ protected:
         std::vector<float>& scales,
         unsigned input_dim, unsigned output_dim
     ) {
-        for (unsigned out_dim = 0; out_dim < output_dim; ++out_dim) {
-            const unsigned packed_cols_stride = input_dim / 8;
-
-            for (unsigned in_block = 0; in_block < input_dim / kMxFp4BlockSize; ++in_block) {
-                std::vector<float> block_vals(kMxFp4BlockSize);
-                for (unsigned i = 0; i < kMxFp4BlockSize; ++i) {
-                    unsigned in_idx = in_block * kMxFp4BlockSize + i;
-                    unsigned weight_idx = in_idx * output_dim + out_dim;
-                    // 使用专家级BF16转换函数
-                    block_vals[i] = Bfloat16ToFloat(original_weights[weight_idx]);
-                }
-
-                float scale = CPUMxFp4Reference::CalculateOptimalScale(block_vals);
-                unsigned scale_idx = in_block * output_dim + out_dim;
-                scales[scale_idx] = scale;
-
-                for (unsigned i = 0; i < kMxFp4BlockSize; ++i) {
-                    unsigned in_idx = in_block * kMxFp4BlockSize + i;
-                    float weight_val = block_vals[i];
-                    unsigned char fp4_idx = CPUMxFp4Reference::QuantizeToE2M1Index(weight_val, scale);
-                    unsigned packed_idx = out_dim * packed_cols_stride + (in_idx / 8);
-                    unsigned bit_offset = (in_idx % 8) * 4;
-                    quantized_data[packed_idx] |= (static_cast<unsigned>(fp4_idx & 0xF) << bit_offset);
-                }
-            }
-        }
+        bf16_data::QuantizeWeightsLayer(original_weights, quantized_data, scales, input_dim, output_dim);
     }
 
     // ============================================================================
@@ -1076,9 +862,9 @@ protected:
     ) {
         std::cout << "Computing hipBLASLt Complete FFN (FP16)..." << std::endl;
 
-        // Step 1: 在函数内部反量化权重
-        auto w1_dequant = CPUDequantizeWeightsFP16(ffn_weights.w1_data, ffn_weights.w1_scales, config.hidden_size, config.intermediate_size);
-        auto w2_dequant = CPUDequantizeWeightsFP16(ffn_weights.w2_data, ffn_weights.w2_scales, config.intermediate_size, config.hidden_size);
+        // Step 1: 在函数内部反量化权重 - 使用工具函数
+        auto w1_dequant = fp16_data::CPUDequantizeWeights(ffn_weights.w1_data, ffn_weights.w1_scales, config.hidden_size, config.intermediate_size);
+        auto w2_dequant = fp16_data::CPUDequantizeWeights(ffn_weights.w2_data, ffn_weights.w2_scales, config.intermediate_size, config.hidden_size);
     
         // 维度定义
         const unsigned m = config.total_tokens;
@@ -1156,10 +942,6 @@ protected:
         CheckHIPStatus(hipFree(d_inter1)); CheckHIPStatus(hipFree(d_inter2)); CheckHIPStatus(hipFree(d_output));
         return result;
     }
-
-// ============================================================================
-// BF16 版本的 hipBLASLt FFN 实现
-// ============================================================================
     std::vector<unsigned short> ComputeHipBLASLtCompleteFFNBF16(
         const std::vector<unsigned short>& input_data,
         const QuantizedFFNWeights& ffn_weights,
@@ -1169,9 +951,9 @@ protected:
     ) {
         std::cout << "Computing hipBLASLt Complete FFN (BF16)..." << std::endl;
 
-        // Step 1: 在函数内部反量化权重
-        auto w1_dequant = CPUDequantizeWeightsBF16(ffn_weights.w1_data, ffn_weights.w1_scales, config.hidden_size, config.intermediate_size);
-        auto w2_dequant = CPUDequantizeWeightsBF16(ffn_weights.w2_data, ffn_weights.w2_scales, config.intermediate_size, config.hidden_size);
+        // Step 1: 在函数内部反量化权重 - 使用工具函数
+        auto w1_dequant = bf16_data::CPUDequantizeWeights(ffn_weights.w1_data, ffn_weights.w1_scales, config.hidden_size, config.intermediate_size);
+        auto w2_dequant = bf16_data::CPUDequantizeWeights(ffn_weights.w2_data, ffn_weights.w2_scales, config.intermediate_size, config.hidden_size);
     
         // 维度定义
         const unsigned m = config.total_tokens;
@@ -1240,27 +1022,7 @@ protected:
         const std::vector<float>& scales,
         unsigned input_dim, unsigned output_dim
     ) {
-        std::vector<half> dequant_weights(input_dim * output_dim);
-        
-        for (unsigned out_dim = 0; out_dim < output_dim; out_dim++) {
-            const unsigned packed_cols_stride = input_dim / 8;
-            
-            for (unsigned in_dim = 0; in_dim < input_dim; in_dim++) {
-                unsigned packed_idx = out_dim * packed_cols_stride + (in_dim / 8);
-                unsigned bit_offset = (in_dim % 8) * 4;
-                unsigned packed_weight = quantized_data[packed_idx];
-                unsigned fp4_val = (packed_weight >> bit_offset) & 0xF;
-                
-                unsigned in_block = in_dim / kMxFp4BlockSize;
-                unsigned scale_idx = in_block * output_dim + out_dim;
-                float scale = scales[scale_idx];
-                
-                float weight_val = CPUMxFp4Reference::CPUDequantE2M1(fp4_val, scale);
-                dequant_weights[in_dim * output_dim + out_dim] = __float2half(weight_val);
-            }
-        }
-        
-        return dequant_weights;
+        return fp16_data::CPUDequantizeWeights(quantized_data, scales, input_dim, output_dim);
     }
 
     std::vector<unsigned short> CPUDequantizeWeightsBF16(
@@ -1268,27 +1030,7 @@ protected:
         const std::vector<float>& scales,
         unsigned input_dim, unsigned output_dim
     ) {
-        std::vector<unsigned short> dequant_weights(input_dim * output_dim);
-        
-        for (unsigned out_dim = 0; out_dim < output_dim; out_dim++) {
-            const unsigned packed_cols_stride = input_dim / 8;
-            
-            for (unsigned in_dim = 0; in_dim < input_dim; in_dim++) {
-                unsigned packed_idx = out_dim * packed_cols_stride + (in_dim / 8);
-                unsigned bit_offset = (in_dim % 8) * 4;
-                unsigned packed_weight = quantized_data[packed_idx];
-                unsigned fp4_val = (packed_weight >> bit_offset) & 0xF;
-                
-                unsigned in_block = in_dim / kMxFp4BlockSize;
-                unsigned scale_idx = in_block * output_dim + out_dim;
-                float scale = scales[scale_idx];
-                
-                float weight_val = CPUMxFp4Reference::CPUDequantE2M1(fp4_val, scale);
-                dequant_weights[in_dim * output_dim + out_dim] = FloatToBfloat16(weight_val);
-            }
-        }
-        
-        return dequant_weights;
+        return bf16_data::CPUDequantizeWeights(quantized_data, scales, input_dim, output_dim);
     }
 
     // ============================================================================

@@ -7,7 +7,11 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
-
+// 添加这些缺失的头文件：
+#include <vector>
+#include <random>
+#include <numeric>  // for std::accumulate
+#include "utils/hip_helper.h"  // for CheckHIPStatus
 namespace causalflow::petit::rocm::quantization::moe {
 
 // ============================================================================
@@ -485,27 +489,6 @@ const char* MoEErrorToString(MoEError error) {
     default:
         return "Unknown error";
     }
-}
-
-// ============================================================================
-// Benchmark预留函数 - 简单实现
-// ============================================================================
-
-int RunMoEBenchmark(
-    const MoEBenchmarkConfig& config,
-    MoEBenchmarkResult* result) {
-    // TODO: 实现benchmark逻辑
-    if (result) {
-        result->avg_time_ms = 0.0;
-        result->min_time_ms = 0.0;
-        result->max_time_ms = 0.0;
-        result->throughput_tflops = 0.0;
-        result->memory_bandwidth = 0.0;
-        result->layer1_time_ms = 0.0;
-        result->activation_time_ms = 0.0;
-        result->layer2_time_ms = 0.0;
-    }
-    return 0;
 }
 
 } // namespace causalflow::petit::rocm::quantization::moe
