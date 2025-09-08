@@ -13,7 +13,7 @@ static constexpr unsigned kPackFactor = 32 / kBits;
 static constexpr unsigned kQuantVecSize = sizeof(uint4) / sizeof(unsigned);
 
 // Only support row group size 16 for now
-static constexpr unsigned kRowGroupSize = 16;
+static constexpr unsigned kRowGroupSize = 32;
 
 template <unsigned kLayoutM_, unsigned kLayoutN_, unsigned kTileM_,
           unsigned kTileN_, unsigned kPackSize_, unsigned kOutputVecBatch_,
@@ -114,6 +114,7 @@ struct RepackScaleLayout
                                kRowGroupSize, sizeof(uchar2) / sizeof(char),
                                kBlockGroupM_, kBlockGroupN_>;
 
+    explicit __device__ RepackScaleLayout(unsigned n) : Base{n} {}                        
     // Define how the 2 u8 are packed across the (m, n) order
     static_assert(kTileM_ * kTileN_ == 2, "The scale tile must be 2");
 };
@@ -122,7 +123,8 @@ using RepackQWeightLayout128x16 = RepackQWeightLayout<128, 16, 4, 1, 2, 2>;
 using RepackScaleLayout128x16 = RepackScaleLayout<128, 16, 2, 1, 2, 1>;
 
 using RepackQWeightLayout64x32 = RepackQWeightLayout<64, 32, 2, 2, 4, 1>;
-using RepackScaleLayout64x32 = RepackScaleLayout<64, 32, 1, 2, 4, 1>;
+using RepackScaleLayout64x32 = RepackScaleLayout<64, 32, 1, 2, 8, 1>;
+
 
 __device__ static unsigned PetitFormat(unsigned v) {
     unsigned r = 0;
@@ -268,34 +270,34 @@ __global__ void DequantizePetitFp4Kernel(uint4 *__restrict__ output,
     using DQ = typename UDQ::DQ;
     using Element = typename DQ::Element;
     using VectorType = typename DQ::VectorType;
-    static constexpr unsigned kLayoutM = QWLayout::kLayoutM;
-    static constexpr unsigned kLayoutN = QWLayout::kLayoutN;
-    static constexpr unsigned kGroupM = QWLayout::kGroupM;
-    static constexpr unsigned kGroupN = QWLayout::kGroupN;
-    static constexpr unsigned kScaleVecSize = sizeof(uchar2) / sizeof(char);
+    //static constexpr unsigned kLayoutM = QWLayout::kLayoutM;
+    //static constexpr unsigned kLayoutN = QWLayout::kLayoutN;
+    //static constexpr unsigned kGroupM = QWLayout::kGroupM;
+    //static constexpr unsigned kGroupN = QWLayout::kGroupN;
+    //static constexpr unsigned kScaleVecSize = sizeof(uchar2) / sizeof(char);
 
     const unsigned tid = threadIdx.x, id_k = blockIdx.x, id_n = blockIdx.y;
     const unsigned wid = tid / kWarpSize, wtid = tid % kWarpSize;
+    if (tid >= QWLayout::kNumWarps * kWarpSize) return;
 
     QWLayout layout(size_n, size_k);
     auto layout_in = layout.GetOnDiskLayout();
 
-    using ScaleShape =
-        Shape<_1, _1, Shape<C<kGroupM / kLayoutM>, C<kGroupN / kLayoutN>>,
-              C<kWarpSize>>;
-    auto stride_scale = make_stride(
-        size_n * kGroupM / kRowGroupSize / kScaleVecSize,
-        C<kLayoutM * kGroupN / kRowGroupSize / kScaleVecSize>{},
-        make_stride(size_n * kLayoutM / kRowGroupSize / kScaleVecSize,
-                    C<kLayoutM * kLayoutN / kRowGroupSize / kScaleVecSize>{}),
-        _1{});
-    auto layout_scale = make_layout(ScaleShape{}, stride_scale);
+    using ScaleLayout = RepackScaleLayout64x32;
+    ScaleLayout scale_layout_reader(size_n);
+    auto layout_scale = scale_layout_reader.GetOnDiskLayout();
+
 
     auto layout_out = layout.GetDequantOutputLayout();
 
     uint4 qw = input[layout_in(make_coord(id_k, id_n, wid, wtid))];
-    unsigned short packed_scale = reinterpret_cast<const unsigned short *>(
-        scales)[layout_scale(make_coord(id_k, id_n, wid, wtid))];
+    unsigned short packed_scale = reinterpret_cast<const unsigned short *>(scales)[layout_scale(make_coord(id_k, id_n, make_coord(wid, 0), wtid))];
+
+
+    if (id_k == 0 && id_n == 0 && tid < 72) {
+        printf("tid=%u, wid=%u, wtid=%u, scale_val=0x%x\n",
+               tid, wid, wtid, packed_scale);
+    }
 
     auto ds = UDQ::DequantScales(packed_scale);
     const auto global_scale_f16 = Element(global_scale);
@@ -331,7 +333,7 @@ __global__ void DequantizeNvFp4Kernel(uint4 *output, const uint4 *input,
     using VectorType = typename Dequantizer::VectorType;
     static constexpr unsigned kGroupK = 128;
     static constexpr unsigned kGroupN = 16;
-    static constexpr unsigned kRowGroupSize = 16;
+    static constexpr unsigned kRowGroupSize = 32;
 
     using Content __attribute__((
         ext_vector_type(32 / (sizeof(uint) / sizeof(Element))))) = uint;
@@ -354,11 +356,11 @@ __global__ void DequantizeNvFp4Kernel(uint4 *output, const uint4 *input,
                     size_k / kRowGroupSize * kGroupN / kScaleVecSize,
                     make_stride(_1{}, size_k / kRowGroupSize / kScaleVecSize));
     auto layout_scale =
-        make_layout(Shape<_1, _1, Shape<_4, _16>>{}, stride_scale);
+        make_layout(Shape<_1, _1, Shape<_4, _8>>{}, stride_scale);
 
     uint4 qw = input[layout_in(make_coord(id_k, id_n, tid))];
     unsigned short packed_scale = reinterpret_cast<const unsigned short *>(
-        scales)[layout_scale(make_coord(id_k, id_n, tid))];
+        scales)[layout_scale(make_coord(id_k, id_n, tid % 32))];
 
     const auto bias = Dequantizer::Bias(false);
     const VectorType bias2{bias, bias};
@@ -424,8 +426,9 @@ int DequantPetitFp4(unsigned *output, const unsigned *input,
                     DataType out_type, unsigned k, unsigned n) {
     // using Layout = RepackQWeightLayout128x16;
     using Layout = RepackQWeightLayout64x32;
+    using ScaleLayout = RepackScaleLayout64x32;
     dim3 grid(k / Layout::kGroupM, n / Layout::kGroupN);
-    dim3 block(Layout::kNumWarps * kWarpSize);
+    dim3 block(ScaleLayout::kNumWarps * kWarpSize); 
     if (k % Layout::kGroupM != 0 || n % Layout::kGroupN != 0) {
         return -1;
     }
