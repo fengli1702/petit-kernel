@@ -150,8 +150,8 @@ template <class Config> struct WarpPartitionMatmul {
             auto va_idx = reg_a_layout(make_coord(j));
             uint q = qw[j];
             typename UDQ::UnpackedData dq;
-            UDQ::DequantWithScale(dq, q, j < 2 ? ds.x : ds.y);
-
+            //UDQ::DequantWithScale(dq, q, j < 2 ? ds.x : ds.y);
+            UDQ::DequantWithScale(dq, q, ds);
             static_assert(sizeof(dq) == sizeof(uint4), "");
             const uint2 *frag_b = reinterpret_cast<const uint2 *>(&dq[0]);
 

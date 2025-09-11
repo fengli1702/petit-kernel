@@ -101,6 +101,36 @@ __device__ static inline void Fp4ToBf8(unsigned o[2], unsigned q) {
     o[1] = qr & 0x8e8e8e8e;
 }
 
+__device__ inline half e8m0_to_half(unsigned char e8m0_val) {
+    uint16_t fp16_bits;
+    if (e8m0_val == 0xFFu) {
+        fp16_bits = 0x7C01u;
+    } else {
+        const int bias_e8m0 = 127;
+        const int bias_fp16 = 15;
+        int exp_unbiased = static_cast<int>(e8m0_val) - bias_e8m0;
+        int exp_fp16 = exp_unbiased + bias_fp16;
+        if (exp_fp16 <= 0) {
+            fp16_bits = 0x0000u;
+        } else if (exp_fp16 >= 0x1F) {
+            fp16_bits = 0x7C00u;
+        } else {
+            fp16_bits = static_cast<uint16_t>( (exp_fp16 & 0x1F) << 10 );
+        }
+    }
+    return __ushort_as_half(fp16_bits);
+}
+
+__device__ inline __hip_bfloat16 e8m0_to_bfloat16(unsigned char e8m0_val) {
+    uint16_t bf16_bits;
+    if (e8m0_val == 0xFFu) {
+        bf16_bits = static_cast<uint16_t>((0xFFu << 7) | 0x1u);
+    } else {
+        bf16_bits = static_cast<uint16_t>(static_cast<uint16_t>(e8m0_val) << 7);
+    }
+    return reinterpret_cast<__hip_bfloat16&>(bf16_bits);
+}
+
 } // namespace detail
 
 template <>
@@ -110,8 +140,9 @@ struct Dequantizer<half2, kDataTypeFp4e2m1>
     using VectorType = half2;
 
     __device__ static Element Bias(bool high_precision) {
-        const unsigned off =
-            high_precision ? kExpOffset - kFp8ScaleBias : kExpOffset;
+        //const unsigned off =
+        //    high_precision ? kExpOffset - kFp8ScaleBias : kExpOffset;
+        const unsigned off = kExpOffset;
         unsigned short v = off << (15 - kFp16Ex);
         return *(const Element *)&v;
     }
@@ -168,17 +199,18 @@ struct DequantizerForFp8Scale<__hip_bfloat162, kUpscale_>
 };
 
 template <bool kHighPrecision> struct UnifiedDequantizerForFp4Fp16 {
-    using UnpackedScale = half2;
+    using UnpackedScale = half;
     using Element = half;
     using UnpackedData = half2[4];
 
     using DQ = Dequantizer<half2, kDataTypeFp4e2m1>;
-    using DS = DequantizerForFp8Scale<half2, !kHighPrecision>;
+    //using DS = DequantizerForFp8Scale<half2, !kHighPrecision>;
 
-    __device__ static UnpackedScale DequantScales(unsigned short s) {
-        UnpackedScale ds;
-        DS::DequantFullScale(&ds, s);
-        return ds;
+    __device__ static UnpackedScale DequantScales(unsigned char s) {
+        //UnpackedScale ds;
+        //DS::DequantFullScale(&ds, s);
+        //return ds;
+        return detail::e8m0_to_half(s);
     }
 
     __device__ static void DequantWithScale(UnpackedData &out, unsigned q,
@@ -198,22 +230,23 @@ template <bool kHighPrecision> struct UnifiedDequantizerForFp4Fp16 {
 };
 
 template <bool kHighPrecision> struct UnifiedDequantizerForFp4Bf16 {
-    using UnpackedScale = __hip_bfloat162;
+    using UnpackedScale = __hip_bfloat16;
     using Element = __hip_bfloat16;
     using UnpackedData = __hip_bfloat162[4];
 
     using DQ = Dequantizer<__hip_bfloat162, kDataTypeFp4e2m1>;
-    using DS = DequantizerForFp8Scale<__hip_bfloat162, !kHighPrecision>;
+    //using DS = DequantizerForFp8Scale<__hip_bfloat162, !kHighPrecision>;
 
-    __device__ static half2 DequantScales(unsigned short s) {
-        using FP8Scale = DequantizerForFp8Scale<half2, false>;
-        half2 ds;
-        FP8Scale::Dequant(&ds, s);
-        return ds;
+    __device__ static UnpackedScale DequantScales(unsigned char s) {
+        //using FP8Scale = DequantizerForFp8Scale<half2, false>;
+        //half2 ds;
+        //FP8Scale::Dequant(&ds, s);
+        //return ds;
+        return detail::e8m0_to_bfloat16(s);
     }
 
     __device__ static void DequantWithScale(UnpackedData &out, unsigned q,
-                                            half scale) {
+                                            Element scale) {// Element is __hip_bfloat16
 #if defined(__gfx942__) || defined(__gfx950__)
         DequantWithScaleImplBf8(out, q, scale);
 #else
@@ -223,26 +256,29 @@ template <bool kHighPrecision> struct UnifiedDequantizerForFp4Bf16 {
 
   private:
     __device__ static void DequantWithScaleImplFp16(UnpackedData &out,
-                                                    unsigned q, half scale);
+                                                    unsigned q, Element scale);
     __device__ static void DequantWithScaleImplBf8(UnpackedData &out,
-                                                   unsigned q, half scale);
+                                                   unsigned q, Element scale);
 };
 
 template <bool kHighPrecision>
 __device__ void
 UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplFp16(
-    UnpackedData &out, unsigned q, half scale) {
+    UnpackedData &out, unsigned q, Element scale) {
 
-    const float2 s2{__half2float(scale), __half2float(scale)};
+    const float2 s2{__bfloat162float(scale), __bfloat162float(scale)};
 
     // Since internallly it is FP16, the bias is the same as the FP16 bias
     // For high precision we divide by 2 ** 7 to undo the preprocessing of
     // the scales
-    static constexpr unsigned kBias = kHighPrecision ? 0x43000000  // 2** 7
-                                                     : 0x46800000; // 2 ** 14
-    const float2 bias_f32_2{reinterpret_cast<const float &>(kBias),
-                            reinterpret_cast<const float &>(kBias)};
-
+    //static constexpr unsigned kBias = kHighPrecision ? 0x43000000  // 2** 7
+    //                                                 : 0x46800000; // 2 ** 14
+    //const float2 bias_f32_2{reinterpret_cast<const float &>(kBias),
+    //                        reinterpret_cast<const float &>(kBias)};
+    //
+    const auto bias_bf16 = DQ::Bias(kHighPrecision); 
+    const float bias_f32 = __bfloat162float(bias_bf16);
+    const float2 bias_f32_2{bias_f32, bias_f32};
     detail::Fp4ToFp16(reinterpret_cast<unsigned *>(&out), q);
     const half2 *h2 = reinterpret_cast<const half2 *>(&out);
     float2 out_f2[4];
@@ -252,9 +288,9 @@ UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplFp16(
     }
 
     for (int i = 0; i < 4; i++) {
-        if constexpr (kHighPrecision) {
-            out_f2[i] = amdgcn_pk_mul_f32(out_f2[i], bias_f32_2);
-        }
+        //if constexpr (kHighPrecision) {
+        out_f2[i] = amdgcn_pk_mul_f32(out_f2[i], bias_f32_2);
+        //}
         out_f2[i] = amdgcn_pk_mul_f32(out_f2[i], s2);
     }
 
@@ -268,18 +304,21 @@ UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplFp16(
 template <bool kHighPrecision>
 __device__ void
 UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplBf8(
-    UnpackedData &out, unsigned q, half scale) {
+    UnpackedData &out, unsigned q, Element scale) {
 #if defined(__gfx942__) || defined(__gfx950__)
-    const float2 s2{__half2float(scale), __half2float(scale)};
+    const float2 s2{__bfloat162float(scale), __bfloat162float(scale)};
 
     // Since internallly it is FP16, the bias is the same as the FP16 bias
     // For high precision we divide by 2 ** 7 to undo the preprocessing of
     // the scales
-    static constexpr unsigned kBias = kHighPrecision ? 0x43000000  // 2** 7
-                                                     : 0x46800000; // 2 ** 14
-    const float2 bias_f32_2{reinterpret_cast<const float &>(kBias),
-                            reinterpret_cast<const float &>(kBias)};
-
+    //static constexpr unsigned kBias = kHighPrecision ? 0x43000000  // 2** 7
+    //                                                 : 0x46800000; // 2 ** 14
+    //const float2 bias_f32_2{reinterpret_cast<const float &>(kBias),
+    //                        reinterpret_cast<const float &>(kBias)};
+//
+    const auto bias_bf16 = DQ::Bias(kHighPrecision);
+    const float bias_f32 = __bfloat162float(bias_bf16);
+    const float2 bias_f32_2{bias_f32, bias_f32};
     unsigned bf8[2];
     detail::Fp4ToBf8(bf8, q);
 
@@ -291,9 +330,9 @@ UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplBf8(
     }
 
     for (int i = 0; i < 4; i++) {
-        if constexpr (kHighPrecision) {
-            out_f2[i] = amdgcn_pk_mul_f32(out_f2[i], bias_f32_2);
-        }
+        //if constexpr (kHighPrecision) {
+        out_f2[i] = amdgcn_pk_mul_f32(out_f2[i], bias_f32_2);
+        //}
         out_f2[i] = amdgcn_pk_mul_f32(out_f2[i], s2);
     }
 

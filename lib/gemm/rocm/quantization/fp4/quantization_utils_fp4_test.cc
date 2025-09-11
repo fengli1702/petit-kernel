@@ -59,7 +59,7 @@ DeviceContext<Element, kM, kN>::PrepareDevice() {
 
     // Only generate positive scales based on how preprocessing of the scales is
     // done
-    std::uniform_int_distribution<unsigned> dist_scale(1, 126);
+    std::uniform_int_distribution<unsigned> dist_scale(0 , 254);
     auto gen_scale_fp8 = [&]() { return dist_scale(gen); };
 
     FillRandomValue(gen_q, &h_qweights);
@@ -85,7 +85,7 @@ void DeviceContext<Element, kM, kN>::CompareOutputsFromDevice() const {
                              hipMemcpyDeviceToHost));
     CheckHIPStatus(hipDeviceSynchronize());
 
-    for (unsigned i = 0; i < 96; ++i) {
+    for (unsigned i = 0; i < 64; ++i) {
         EXPECT_EQ(h_reference[i], h_petit_output[i])
             << "Output and reference differ at index " << i;
     }
@@ -123,9 +123,9 @@ class NvFp4ToPetitFp4Test : public ::testing::Test {
     }
 };
 
-//TEST_F(NvFp4ToPetitFp4Test, TestLayout128x16Bf16) {
-//    TestConvert<hip_bfloat16, 512, 512>(1.0, kDataTypeBf16);
-//}
+TEST_F(NvFp4ToPetitFp4Test, TestLayout128x16Bf16) {
+    TestConvert<hip_bfloat16, 512, 512>(1.0, kDataTypeBf16);
+}
 
 TEST_F(NvFp4ToPetitFp4Test, TestLayout128x16Fp16) {
     TestConvert<half, 512, 512>(1.0, kDataTypeFp16);
