@@ -17,7 +17,8 @@ static constexpr unsigned kRowGroupSize = 32;
 
 template <unsigned kLayoutM_, unsigned kLayoutN_, unsigned kTileM_,
           unsigned kTileN_, unsigned kPackSize_, unsigned kOutputVecBatch_,
-          unsigned kBlockGroupM_, unsigned kBlockGroupN_>
+          unsigned kBlockGroupM_, unsigned kBlockGroupN_, unsigned warp_size =
+              64>
 struct TileShmLayout {
     static constexpr unsigned kLayoutM = kLayoutM_;
     static constexpr unsigned kLayoutN = kLayoutN_;
@@ -28,8 +29,8 @@ struct TileShmLayout {
         using namespace causalflow::tal;
         using ShmShape =
             Shape<Shape<C<kTileM_>, C<kTileN_>>,
-                  Shape<C<kBlockGroupM_>, C<kBlockGroupN_>>, Shape<_32, _2>>;
-        using ShmStride = Stride<Stride<_1, C<0>>,
+                  Shape<C<kBlockGroupM_>, C<kBlockGroupN_>>, Shape<_16, _4>>;
+        using ShmStride = Stride<Stride<_1, C<16 * kGroupM / kPackSize_>>,
                                  Stride<C<kLayoutM / kPackSize_>,
                                         C<kGroupM * kLayoutN / kPackSize_>>,
                                  Stride<C<kGroupM / kPackSize_>, C<kTileM_>>>;
@@ -42,12 +43,12 @@ struct TileShmLayout {
 
         using OutputShape =
             Shape<_1, _1, Shape<C<kBlockGroupM_>, C<kBlockGroupN_>>,
-                  C<kWarpSize>>;
+                  C<warp_size>>;
         auto output_stride = make_stride(
             n_ * kGroupM / kPackSize_ / kOutputVecBatch_,
             C<kLayoutM * kGroupN / kPackSize_ / kOutputVecBatch_>{},
             make_stride(n_ * kLayoutM / kPackSize_ / kOutputVecBatch_,
-                        C<kWarpSize>{}),
+                        C<warp_size>{}),
             _1{});
         auto output_layout = make_layout(OutputShape{}, output_stride);
         return output_layout;
@@ -63,7 +64,7 @@ struct RepackQWeightLayout
                            kQuantVecSize, kBlockGroupM_, kBlockGroupN_> {
     using Base =
         TileShmLayout<kLayoutM_, kLayoutN_, kTileM_, kTileN_, kPackFactor,
-                      kQuantVecSize, kBlockGroupM_, kBlockGroupN_>;
+                      kQuantVecSize, kBlockGroupM_, kBlockGroupN_, 64>;
     static constexpr unsigned kNumWarps = kBlockGroupM_ * kBlockGroupN_;
     static constexpr unsigned kDequantOutputBatch =
         kPackFactor * (sizeof(uint4) / sizeof(uint)) * sizeof(half) /
@@ -89,13 +90,13 @@ struct RepackQWeightLayout
 
         using OutputShape =
             Shape<_1, _1, Shape<C<kBlockGroupM_>, C<kBlockGroupN_>>,
-                  Shape<_32, _2>, Shape<C<kTileM_>, C<kTileN_>>>;
+                  Shape<_16, _4>, Shape<C<kTileM_>, C<kTileN_>>>;
         auto stride_out =
             make_stride(C<kGroupM / kOutVecSize>{}, k_ * kGroupN / kOutVecSize,
                         make_stride(C<kLayoutM / kOutVecSize>{},
                                     k_ * kLayoutN / kOutVecSize),
                         make_stride(k_ / kOutVecSize, C<kTileM_>{}),
-                        make_stride(_1{}, _0{}));
+                        make_stride(_1{}, k_ * 16 / kOutVecSize));
         auto layout_out = make_layout(OutputShape{}, stride_out);
         return layout_out;
     }
@@ -107,22 +108,23 @@ template <unsigned kLayoutM_, unsigned kLayoutN_, unsigned kTileM_,
           unsigned kTileN_, unsigned kBlockGroupM_, unsigned kBlockGroupN_>
 struct RepackScaleLayout
     : public TileShmLayout<kLayoutM_, kLayoutN_, kTileM_, kTileN_,
-                           kRowGroupSize, sizeof(unsigned char) / sizeof(char),
-                           kBlockGroupM_, kBlockGroupN_> {
+                           kRowGroupSize, sizeof(uchar2) / sizeof(char),
+                           kBlockGroupM_, kBlockGroupN_, 32> {
     static constexpr unsigned kNumWarps = kBlockGroupM_ * kBlockGroupN_;
     using Base = TileShmLayout<kLayoutM_, kLayoutN_, kTileM_, kTileN_,
-                               kRowGroupSize, sizeof(unsigned char) / sizeof(char),
+                               kRowGroupSize, sizeof(uchar2) / sizeof(char),
                                kBlockGroupM_, kBlockGroupN_>;
 
     // Define how the 2 u8 are packed across the (m, n) order
-    static_assert(kTileM_ * kTileN_ == 1, "The scale tile must be 1");
+    static_assert(kTileM_ * kTileN_ == 2, "The scale tile must be 2");
 };
 
 using RepackQWeightLayout128x16 = RepackQWeightLayout<128, 16, 4, 1, 2, 2>;
-using RepackScaleLayout128x16 = RepackScaleLayout<128, 16, 1, 1, 2, 1>;
+using RepackScaleLayout128x16 = RepackScaleLayout<128, 16, 2, 1, 2, 1>;
 
-using RepackQWeightLayout64x32 = RepackQWeightLayout<64, 32, 4, 1, 4, 1>;
-using RepackScaleLayout64x32 = RepackScaleLayout<64, 32, 1, 1, 4, 1>;
+using RepackQWeightLayout64x32 = RepackQWeightLayout<64, 32, 2, 2, 4, 1>;
+using RepackScaleLayout64x32 = RepackScaleLayout<64, 32, 1, 2, 4, 1>;
+
 
 __device__ static unsigned PetitFormat(unsigned v) {
     unsigned r = 0;
@@ -134,8 +136,13 @@ __device__ static unsigned PetitFormat(unsigned v) {
             off_d = off_s + 4;
         }
         unsigned u = (v >> (i * 4)) & 0xf;
-        unsigned sgn = u >> 3;
         unsigned val = u & 0x7;
+
+        // Change negative zero to positive zero as in MI300x natively
+        // supports e5m2fnuz where 0x80 will be incorrectly dequantized to NaN
+        // in Petit.
+        unsigned sgn = val == 0 ? 0 : u >> 3;
+
         if (i >= 4) {
             val = __builtin_bitreverse32(val) >> 29;
         }
@@ -164,7 +171,6 @@ __global__ void RepackNvFp4ToPetitFp4WeightsKernel(
 
     __shared__ uint4 shm_qw[kGroupInts / kQuantVecSize];
 
-
     [[assume(tid < kThreads)]];
     for (unsigned i = 0, idx = tid;
          i < tal::CeilingDiv(kGroupInts / kQuantVecSize, kThreads) &&
@@ -181,7 +187,6 @@ __global__ void RepackNvFp4ToPetitFp4WeightsKernel(
 
     const unsigned *sqw = reinterpret_cast<const unsigned *>(shm_qw);
 
-
     unsigned ret[4];
     for (int i = 0; i < 4; i++) {
         auto coord = shm_layout(make_coord(i, wid, wtid));
@@ -195,16 +200,15 @@ __global__ void RepackNvFp4ToPetitFp4WeightsKernel(
 
 template <class ScaleLayout, unsigned kExpBias = 0>
 __global__ void RepackNvFp4ScalesKernel(uint64_t *__restrict__ out_scales,
-                                        const uint64_t *__restrict__ scales,
+                                        const uint4 *__restrict__ scales,
                                         unsigned in_chan, unsigned out_chan) {
     using namespace causalflow::tal;
     using Element = unsigned char;
 
     static constexpr unsigned kGroupM = ScaleLayout::kGroupM;
     static constexpr unsigned kGroupN = ScaleLayout::kGroupN;
-    static constexpr unsigned kVecSize = sizeof(uint64_t) / sizeof(Element);//8
+    static constexpr unsigned kVecSize = sizeof(uint64_t) / sizeof(Element);
     static constexpr unsigned kThreads = kWarpSize;
-    static constexpr unsigned kRowGroupSize = 32;
 
     const unsigned tid = threadIdx.x, id_m = blockIdx.x, id_n = blockIdx.y;
     const unsigned wid = tid / kWarpSize, wtid = tid % kWarpSize;
@@ -213,7 +217,7 @@ __global__ void RepackNvFp4ScalesKernel(uint64_t *__restrict__ out_scales,
         scales + id_m * kGroupM / kRowGroupSize / kVecSize +
         id_n * in_chan / kRowGroupSize * kGroupN / kVecSize;
 
-    // const half kMultiple = half(1 << kExpBias);
+    //const half kMultiple = half(1 << kExpBias);
 
     ScaleLayout scale_layout{out_chan};
 
@@ -236,23 +240,30 @@ __global__ void RepackNvFp4ScalesKernel(uint64_t *__restrict__ out_scales,
 
     __syncthreads();
 
-    const __hip_fp8_storage_t *shm =
+    if(wtid<32){
+        const __hip_fp8_storage_t *shm =
         reinterpret_cast<const __hip_fp8_storage_t *>(shm_scales);
 
-    auto shm_layout = scale_layout.GetShmLayout();
-    unsigned char data = shm[shm_layout(make_coord(0, wid, wtid))];
-
-    unsigned char ret = data;
+        auto shm_layout = scale_layout.GetShmLayout();
+        unsigned short data;
+        auto v = reinterpret_cast<__hip_fp8_storage_t *>(&data);
+        v[0] = shm[shm_layout(make_coord(0, wid, wtid))];
+        v[1] = shm[shm_layout(make_coord(1, wid, wtid))];
+        unsigned short ret;
     
-    auto output_coord = output_layout(make_coord(id_m, id_n, wid, wtid));
-    auto out_s2 = reinterpret_cast<unsigned char *>(out_scales);
-    out_s2[output_coord] = ret;
+        ret = data;
+    
+    
+        auto output_coord = output_layout(make_coord(id_m, id_n, wid, wtid));
+        auto out_s2 = reinterpret_cast<unsigned short *>(out_scales);
+        out_s2[output_coord] = ret;
+    }
 }
 
 template <class QWLayout, class UDQ>
 __global__ void DequantizePetitFp4Kernel(uint4 *__restrict__ output,
                                          const uint4 *__restrict__ input,
-                                         const uint64_t *__restrict__ scales,
+                                         const uint4 *__restrict__ scales,
                                          float global_scale, unsigned size_k,
                                          unsigned size_n) {
     using namespace causalflow::tal;
@@ -263,7 +274,7 @@ __global__ void DequantizePetitFp4Kernel(uint4 *__restrict__ output,
     static constexpr unsigned kLayoutN = QWLayout::kLayoutN;
     static constexpr unsigned kGroupM = QWLayout::kGroupM;
     static constexpr unsigned kGroupN = QWLayout::kGroupN;
-    static constexpr unsigned kScaleVecSize = sizeof(unsigned char) / sizeof(char);
+    static constexpr unsigned kScaleVecSize = sizeof(uchar2) / sizeof(char);
 
     const unsigned tid = threadIdx.x, id_k = blockIdx.x, id_n = blockIdx.y;
     const unsigned wid = tid / kWarpSize, wtid = tid % kWarpSize;
@@ -273,7 +284,7 @@ __global__ void DequantizePetitFp4Kernel(uint4 *__restrict__ output,
 
     using ScaleShape =
         Shape<_1, _1, Shape<C<kGroupM / kLayoutM>, C<kGroupN / kLayoutN>>,
-              C<kWarpSize>>;
+              C<kWarpSize/2>>;
     auto stride_scale = make_stride(
         size_n * kGroupM / kRowGroupSize / kScaleVecSize,
         C<kLayoutM * kGroupN / kRowGroupSize / kScaleVecSize>{},
@@ -281,29 +292,30 @@ __global__ void DequantizePetitFp4Kernel(uint4 *__restrict__ output,
                     C<kLayoutM * kLayoutN / kRowGroupSize / kScaleVecSize>{}),
         _1{});
     auto layout_scale = make_layout(ScaleShape{}, stride_scale);
-    //kLayoutM * kLayoutN / kRowGroupSize / kScaleVecSize = 64*32/32/1=64
+
     auto layout_out = layout.GetDequantOutputLayout();
 
     uint4 qw = input[layout_in(make_coord(id_k, id_n, wid, wtid))];
-    unsigned char packed_scale = reinterpret_cast<const unsigned char *>(
-        scales)[layout_scale(make_coord(id_k, id_n, wid, wtid))];
+    
 
+    const unsigned wr     =  wtid & 0x0F;           // N 内 16 槽
+    const unsigned wc     = (wtid >> 4) & 0x3;      // 4 个 K 段
+    const unsigned lane32 = wr + 16 * ((wc >> 1) & 0x1);  // (0/1)->0..15, (2/3)->16..31
+
+    unsigned short packed_scale = reinterpret_cast<const unsigned short *>(
+        scales)[layout_scale(make_coord(id_k, id_n, wid, lane32))];
 
     auto ds = UDQ::DequantScales(packed_scale);
-
-
     const auto global_scale_f16 = Element(global_scale);
     VectorType gs2{global_scale_f16, global_scale_f16};
 
     VectorType ret[16];
 
     for (int i = 0; i < 4; i++) {
-        const uint q = reinterpret_cast<const uint *>(&qw)[i]; //petit format
-        const auto s = ds; //decode过的 scale
-        
+        const uint q = reinterpret_cast<const uint *>(&qw)[i];
+        const auto s = i < 2 ? ds.x : ds.y;
         typename UDQ::UnpackedData dq;
         UDQ::DequantWithScale(dq, q, s);
-
         for (int j = 0; j < 4; j++) {
             ret[i * 4 + j] = __hmul2(dq[j], gs2);
         }
@@ -318,7 +330,7 @@ __global__ void DequantizePetitFp4Kernel(uint4 *__restrict__ output,
 
 template <class UDQ>
 __global__ void DequantizeNvFp4Kernel(uint4 *output, const uint4 *input,
-                                      const unsigned char *scales, float global_scale,
+                                      const uchar2 *scales, float global_scale,
                                       unsigned size_k, unsigned size_n) {
     using namespace causalflow::tal;
     using Dequantizer = typename UDQ::DQ;
@@ -327,12 +339,12 @@ __global__ void DequantizeNvFp4Kernel(uint4 *output, const uint4 *input,
     using VectorType = typename Dequantizer::VectorType;
     static constexpr unsigned kGroupK = 128;
     static constexpr unsigned kGroupN = 16;
-    static constexpr unsigned kRowGroupSize =32;
+    static constexpr unsigned kRowGroupSize = 16;
 
     using Content __attribute__((
         ext_vector_type(32 / (sizeof(uint) / sizeof(Element))))) = uint;
     static constexpr unsigned kOutVecSize = sizeof(Content) / sizeof(Element);
-    static constexpr unsigned kScaleVecSize = sizeof(unsigned char) / sizeof(char);
+    static constexpr unsigned kScaleVecSize = sizeof(uchar2) / sizeof(char);
     const unsigned tid = threadIdx.x, id_k = blockIdx.x, id_n = blockIdx.y;
 
     auto stride_in =
@@ -353,12 +365,18 @@ __global__ void DequantizeNvFp4Kernel(uint4 *output, const uint4 *input,
         make_layout(Shape<_1, _1, Shape<_4, _16>>{}, stride_scale);
 
     uint4 qw = input[layout_in(make_coord(id_k, id_n, tid))];
-    unsigned char packed_scale = scales[layout_scale(make_coord(id_k, id_n, tid))];
+    unsigned short packed_scale = reinterpret_cast<const unsigned short *>(
+        scales)[layout_scale(make_coord(id_k, id_n, tid))];
 
-    auto ds = UDQ::DequantScales(packed_scale);
-    
     const auto bias = Dequantizer::Bias(false);
     const VectorType bias2{bias, bias};
+
+    // The scale is in the E4M3 format, we need to convert it to the E5M3 format
+    // and times 2**7 to reuse the dequantizer.
+    half2 ds;
+    ds.x = __hip_cvt_fp8_to_halfraw(packed_scale & 0xff, __HIP_E4M3);
+    ds.y = __hip_cvt_fp8_to_halfraw((packed_scale >> 8), __HIP_E4M3);
+    ds = __hmul2(ds, half2{1 << kFp8ScaleBias, 1 << kFp8ScaleBias});
 
     VectorType ret[16];
 
@@ -368,12 +386,10 @@ __global__ void DequantizeNvFp4Kernel(uint4 *output, const uint4 *input,
     typename UDQ::UnpackedData dq;
     for (int i = 0; i < 4; i++) {
         const uint q = reinterpret_cast<const uint *>(&qw)[i];
-        
         unsigned q_shifted = PetitFormat(q);
- 
-        const auto s = ds;
+        const auto s = i < 2 ? ds.x : ds.y;
         UDQ::DequantWithScale(dq, q_shifted, s);
-        
+
         for (int j = 0; j < 4; j++) {
             ret[i * 4 + j] = __hmul2(dq[j], gs2);
         }
@@ -398,13 +414,13 @@ int DequantNvFp4(unsigned *output, const unsigned *input,
         DequantizeNvFp4Kernel<UDQ><<<grid, block>>>(
             reinterpret_cast<uint4 *>(output),
             reinterpret_cast<const uint4 *>(input),
-            reinterpret_cast<const unsigned char *>(scales), global_scale, k, n);
+            reinterpret_cast<const uchar2 *>(scales), global_scale, k, n);
     } else if (out_type == kDataTypeBf16) {
         using UDQ = UnifiedDequantizerForFp4Bf16<true>;
         DequantizeNvFp4Kernel<UDQ><<<grid, block>>>(
             reinterpret_cast<uint4 *>(output),
             reinterpret_cast<const uint4 *>(input),
-            reinterpret_cast<const unsigned char *>(scales), global_scale, k, n);
+            reinterpret_cast<const uchar2 *>(scales), global_scale, k, n);
     } else {
         return -1;
     }
@@ -424,18 +440,18 @@ int DequantPetitFp4(unsigned *output, const unsigned *input,
 
     if (out_type == kDataTypeFp16) {
         using UDQ = UnifiedDequantizerForFp4Fp16<true>;
-        //global_scale *= UDQ::DS::GlobalScaleFactor();
+        global_scale *= UDQ::DS::GlobalScaleFactor();
         DequantizePetitFp4Kernel<Layout, UDQ><<<grid, block>>>(
             reinterpret_cast<uint4 *>(output),
             reinterpret_cast<const uint4 *>(input),
-            reinterpret_cast<const uint64_t *>(scales), global_scale, k, n);
+            reinterpret_cast<const uint4 *>(scales), global_scale, k, n);
     } else if (out_type == kDataTypeBf16) {
         using UDQ = UnifiedDequantizerForFp4Bf16<true>;
-        //global_scale *= UDQ::DS::GlobalScaleFactor();
+        global_scale *= UDQ::DS::GlobalScaleFactor();
         DequantizePetitFp4Kernel<Layout, UDQ><<<grid, block>>>(
             reinterpret_cast<uint4 *>(output),
             reinterpret_cast<const uint4 *>(input),
-            reinterpret_cast<const uint64_t *>(scales), global_scale, k, n);
+            reinterpret_cast<const uint4 *>(scales), global_scale, k, n);
     } else {
         return -1;
     }
@@ -472,8 +488,8 @@ void RepackNvFp4ToPetitFp4Scales(unsigned *out_scales, const unsigned *scales,
     dim3 block(ScaleLayout::kNumWarps * kWarpSize);
     RepackNvFp4ScalesKernel<ScaleLayout, kFp8ScaleBias>
         <<<scale_grid, block, 0, stream>>>(
-            reinterpret_cast<uint64_t *>(out_scales),
-            reinterpret_cast<const uint64_t *>(scales), in_chan, out_chan);
+            reinterpret_cast<uint4 *>(out_scales),
+            reinterpret_cast<const uint4 *>(scales), in_chan, out_chan);
 }
 
 } // namespace causalflow::petit::rocm::quantization::fp4
